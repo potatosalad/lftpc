@@ -103,6 +103,13 @@
 -export([ftp_type/4]).
 -export([ftp_user/4]).
 
+%% Internal
+-export([is_int_response/1]).
+-export([is_pos_response/1]).
+-export([is_pre_response/1]).
+-export([is_pre_pos_response/1]).
+-export([is_response_code/2]).
+
 %%====================================================================
 %% API functions
 %%====================================================================
@@ -148,7 +155,7 @@ append(Socket, Pathname, Data, Timeout, Options) ->
 		{ok, _} ->
 			case ftp_appe(Socket, Pathname, Data, Timeout, Options) of
 				{ok, AppeResponse} ->
-					case is_int_response(AppeResponse) of
+					case is_pre_pos_response(AppeResponse) of
 						true ->
 							{ok, AppeResponse};
 						false ->
@@ -520,7 +527,7 @@ restart(Socket, Pathname, Offset, Timeout, Options) ->
 						true ->
 							case ftp_retr(Socket, Pathname, Timeout, Options) of
 								{ok, RetrResponse} ->
-									case is_int_response(RetrResponse) of
+									case is_pre_pos_response(RetrResponse) of
 										true ->
 											{ok, RetrResponse};
 										false ->
@@ -544,7 +551,7 @@ retrieve(Socket, Pathname, Timeout, Options) ->
 		{ok, _} ->
 			case ftp_retr(Socket, Pathname, Timeout, Options) of
 				{ok, RetrResponse} ->
-					case is_int_response(RetrResponse) of
+					case is_pre_pos_response(RetrResponse) of
 						true ->
 							{ok, RetrResponse};
 						false ->
@@ -594,7 +601,7 @@ store(Socket, Pathname, Data, Timeout, Options) ->
 		{ok, _} ->
 			case ftp_stor(Socket, Pathname, Data, Timeout, Options) of
 				{ok, StorResponse} ->
-					case is_int_response(StorResponse) of
+					case is_pre_pos_response(StorResponse) of
 						true ->
 							{ok, StorResponse};
 						false ->
@@ -878,6 +885,22 @@ is_pos_response({[{Code, _} | _], _}) when Code >= 200 andalso Code < 400 ->
 is_pos_response({[{_, _} | Rest], Pid}) ->
 	is_pos_response({Rest, Pid});
 is_pos_response({[], _}) ->
+	false.
+
+%% @private
+is_pre_response({[{Code, _} | _], _}) when Code >= 100 andalso Code < 200 ->
+	true;
+is_pre_response({[{_, _} | Rest], Pid}) ->
+	is_pre_response({Rest, Pid});
+is_pre_response({[], _}) ->
+	false.
+
+%% @private
+is_pre_pos_response({[{Code, _} | _], _}) when Code >= 100 andalso Code < 300 ->
+	true;
+is_pre_pos_response({[{_, _} | Rest], Pid}) ->
+	is_pre_pos_response({Rest, Pid});
+is_pre_pos_response({[], _}) ->
 	false.
 
 %% @private
