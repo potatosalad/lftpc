@@ -148,7 +148,7 @@ append(Socket, Pathname, Data, Timeout, Options) ->
 		{ok, _} ->
 			case ftp_appe(Socket, Pathname, Data, Timeout, Options) of
 				{ok, AppeResponse} ->
-					case is_pos_response(AppeResponse) of
+					case is_int_response(AppeResponse) of
 						true ->
 							{ok, AppeResponse};
 						false ->
@@ -516,11 +516,11 @@ restart(Socket, Pathname, Offset, Timeout, Options) ->
 		{ok, _} ->
 			case ftp_rest(Socket, Offset, Timeout, Opts) of
 				{ok, RestResponse} ->
-					case is_int_response(RestResponse) of
+					case is_pos_response(RestResponse) of
 						true ->
 							case ftp_retr(Socket, Pathname, Timeout, Options) of
 								{ok, RetrResponse} ->
-									case is_pos_response(RetrResponse) of
+									case is_int_response(RetrResponse) of
 										true ->
 											{ok, RetrResponse};
 										false ->
@@ -544,7 +544,7 @@ retrieve(Socket, Pathname, Timeout, Options) ->
 		{ok, _} ->
 			case ftp_retr(Socket, Pathname, Timeout, Options) of
 				{ok, RetrResponse} ->
-					case is_pos_response(RetrResponse) of
+					case is_int_response(RetrResponse) of
 						true ->
 							{ok, RetrResponse};
 						false ->
@@ -594,7 +594,7 @@ store(Socket, Pathname, Data, Timeout, Options) ->
 		{ok, _} ->
 			case ftp_stor(Socket, Pathname, Data, Timeout, Options) of
 				{ok, StorResponse} ->
-					case is_pos_response(StorResponse) of
+					case is_int_response(StorResponse) of
 						true ->
 							{ok, StorResponse};
 						false ->
