@@ -31,7 +31,7 @@
 -export([delete/4]).
 -export([disconnect/3]).
 -export([features/3]).
--export([keep_alive/2]).
+-export([keep_alive/3]).
 -export([login_anonymous/3]).
 -export([login/4]).
 -export([ls/3]).

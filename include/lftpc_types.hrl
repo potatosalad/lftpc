@@ -20,7 +20,7 @@
 -type option() ::
 	{partial_download, partial_download_options()} |
 	{partial_upload, non_neg_integer() | infinity} |
-	{send_retry, non_neg_integer()},
+	{send_retry, non_neg_integer()} |
 	{stream_to, pid()}.
 
 -type options() :: [option()].
