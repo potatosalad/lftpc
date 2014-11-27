@@ -201,15 +201,25 @@ connect(Address, Port, Options) ->
 	connect(Address, Port, Options, infinity).
 
 connect(Address, Port, Options, Timeout) ->
-	{TLS, Opts} = case lists:keytake(tls, 1, Options) of
-		{value, {tls, explicit}, O} ->
-			{explicit, O};
+	{TLS, Opts0} = case lists:keytake(tls, 1, Options) of
+		{value, {tls, explicit}, O0} ->
+			{explicit, O0};
 		{value, {tls, implicit}, _} ->
 			{implicit, Options};
 		_ ->
 			{false, Options}
 	end,
-	case lftpc_sock:connect(Address, Port, Opts, Timeout) of
+	{Active, Opts1} = case lists:keytake(active, 1, Opts0) of
+		{value, {active, false}, O1} ->
+			{false, O1};
+		{value, {active, once}, O1} ->
+			{once, O1};
+		{value, {active, true}, O1} ->
+			{true, O1};
+		_ ->
+			{false, Opts0}
+	end,
+	case lftpc_sock:connect(Address, Port, Opts1, Timeout) of
 		{ok, Socket} ->
 			case read_response_timeout(Socket, undefined, Timeout) of
 				{ok, Result} ->
@@ -217,6 +227,7 @@ connect(Address, Port, Options, Timeout) ->
 						true ->
 							case maybe_tls(Socket, TLS, Timeout) of
 								{ok, _} ->
+									lftpc_sock:setopts(Socket, [{active, Active}]),
 									{ok, Result};
 								TLSError ->
 									ok = close(Socket),
@@ -954,8 +965,10 @@ maybe_tls(Socket, implicit, Timeout) ->
 
 %% @private
 read_response(Socket, Ref, Acc) ->
+	lftpc_sock:setopts(Socket, [{active, once}]),
 	receive
 		{ftp, Socket, {Ref, Reply={Code, _}}} when Code >= 200 andalso Code < 600 ->
+			lftpc_sock:setopts(Socket, [{active, once}]),
 			receive
 				{ftp, Socket, {Ref, done}} ->
 					{ok, {lists:reverse([Reply | Acc]), Socket}}
@@ -970,8 +983,10 @@ read_response(Socket, Ref, Acc) ->
 
 %% @private
 read_response(Socket, Ref, Acc, TRef) ->
+	lftpc_sock:setopts(Socket, [{active, once}]),
 	receive
 		{ftp, Socket, {Ref, Reply={Code, _}}} when Code >= 200 andalso Code < 600 ->
+			lftpc_sock:setopts(Socket, [{active, once}]),
 			receive
 				{ftp, Socket, {Ref, done}} ->
 					ok = cancel_timeout(TRef),
