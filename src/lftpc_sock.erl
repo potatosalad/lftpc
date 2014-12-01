@@ -48,9 +48,13 @@
 	% Buffers
 	rcvbuf = undefined :: undefined | queue:queue(term()),
 	% Options
-	active = undefined :: undefined | false | once | true,
-	open   = passive   :: passive | active
+	active    = undefined :: undefined | false | once | true,
+	keepalive = false     :: true | timeout(),
+	kref      = undefined :: undefined | reference(),
+	open      = passive   :: passive | active
 }).
+
+-define(KEEPALIVE, 60000). %% timer:minutes(1).
 
 %%%===================================================================
 %%% API functions
@@ -162,14 +166,15 @@ init({Owner, Address, Port, Options, Timeout}) ->
 	process_flag(trap_exit, true),
 	true = erlang:link(Owner),
 	Active = get_value(active, Options, false),
+	Keepalive = get_value(keepalive, Options, false),
 	Open = get_value(open, Options, passive),
 	Rcvbuf = queue:new(),
 	case lftpc_prim:connect(Address, Port, Options, Timeout) of
 		{ok, Socket} ->
 			ok = proc_lib:init_ack({ok, self()}),
 			State = #state{owner=Owner, socket=Socket, active=Active,
-				open=Open, rcvbuf=Rcvbuf},
-			gen_server:enter_loop(?MODULE, [], State);
+				open=Open, keepalive=Keepalive, rcvbuf=Rcvbuf},
+			gen_server:enter_loop(?MODULE, [], keepalive_start(State));
 		ConnectError ->
 			ok = proc_lib:init_ack(ConnectError),
 			exit(normal)
@@ -207,10 +212,10 @@ handle_call(_Request, {Owner, _}, State=#state{owner=Owner, req=Req})
 	{reply, {error, {request_in_progress}}, State};
 handle_call({call, Command}, {Owner, _}, State=#state{owner=Owner, socket=Socket}) ->
 	Reply = lftpc_prim:call(Socket, Command),
-	{reply, Reply, State};
+	{reply, Reply, keepalive_stop(State)};
 handle_call({call, Command, Argument}, {Owner, _}, State=#state{owner=Owner, socket=Socket}) ->
 	Reply = lftpc_prim:call(Socket, Command, Argument),
-	{reply, Reply, State};
+	{reply, Reply, keepalive_stop(State)};
 handle_call(close, {Owner, _}, State=#state{owner=Owner, socket=Socket}) ->
 	Reply = lftpc_prim:close(Socket),
 	{reply, Reply, State};
@@ -263,7 +268,12 @@ handle_cast(_Request, State) ->
 %% @private
 handle_info({ftp, Socket, Message}, State=#state{socket=Socket}) ->
 	NewState = owner_send(State, {ftp, self(), Message}),
-	{noreply, NewState};
+	case Message of
+		{_, done} ->
+			{noreply, keepalive_start(NewState)};
+		_ ->
+			{noreply, NewState}
+	end;
 handle_info({ftp_closed, Socket}, State=#state{socket=Socket}) ->
 	NewState = owner_send(State, {ftp_closed, self()}),
 	{noreply, NewState};
@@ -280,9 +290,16 @@ handle_info({response, ReqId, Pid, Socket}, State=#state{req={ReqId, Pid}, socke
 			ok
 	end,
 	lftpc_prim:setopts(Socket, [{active, Active}]),
-	{noreply, State#state{req=undefined}};
-% handle_info({'EXIT', Pid, _Reason}, State=#state{req={_, Pid}}) ->
-% 	{noreply, State#state{req=undefined}};
+	{noreply, keepalive_start(State#state{req=undefined})};
+handle_info({timeout, KRef, keepalive}, State=#state{kref=KRef, req=undefined, socket=Socket})
+		when is_reference(KRef) ->
+	case lftpc_prim:call(Socket, <<"NOOP">>) of
+		{ok, CRef} ->
+			{noreply, keepalive_check(CRef, State#state{kref=undefined})}
+	end;
+handle_info({timeout, KRef, keepalive}, State=#state{kref=KRef})
+		when is_reference(KRef) ->
+	{noreply, keepalive_stop(State)};
 handle_info(Info, State) ->
 	error_logger:error_msg(
 		"** ~p ~p unhandled info in ~p/~p~n"
@@ -337,6 +354,8 @@ options_get(Options, State) ->
 %% @private
 options_get([active | Options], Acc, State=#state{active=Active}) ->
 	options_get(Options, [{active, Active} | Acc], State);
+options_get([keepalive | Options], Acc, State=#state{keepalive=Keepalive}) ->
+	options_get(Options, [{keepalive, Keepalive} | Acc], State);
 options_get([open | Options], Acc, State=#state{open=Open}) ->
 	options_get(Options, [{open, Open} | Acc], State);
 options_get([owner | Options], Acc, State=#state{owner=Owner}) ->
@@ -363,6 +382,11 @@ options_set([{active, Active} | Options], State=#state{socket=Socket})
 		Error ->
 			{Error, State}
 	end;
+options_set([{keepalive, Keepalive} | Options], State)
+		when Keepalive =:= false
+		orelse Keepalive =:= true
+		orelse (is_integer(Keepalive) andalso Keepalive >= 0) ->
+	options_set(Options, keepalive_start(State#state{keepalive=Keepalive}));
 options_set([{open, Open} | Options], State)
 		when Open =:= active
 		orelse Open =:= passive
@@ -390,6 +414,64 @@ options_set_active(Active, State=#state{active=false}) ->
 	owner_flush(State#state{active=Active});
 options_set_active(Active, State) ->
 	State#state{active=Active}.
+
+%%%-------------------------------------------------------------------
+%%% Keepalive functions
+%%%-------------------------------------------------------------------
+
+%% @private
+keepalive_check(CRef, State=#state{keepalive=Keepalive, socket=Socket, active=Active}) ->
+	lftpc_prim:setopts(Socket, [{active, once}]),
+	receive
+		{ftp, Socket, {CRef, M={Code, _}}} when Code >= 100 andalso Code < 200 ->
+			keepalive_check(CRef, State);
+		{ftp, Socket, {CRef, M={Code, _}}} when Code >= 200 ->
+			keepalive_check(CRef, State);
+		{ftp, Socket, {CRef, done}} ->
+			lftpc_prim:setopts(Socket, [{active, Active}]),
+			keepalive_start(State);
+		M={ftp, Socket, _Message} ->
+			{noreply, NewState} = handle_info(M, State#state{keepalive=undefined}),
+			keepalive_check(CRef, NewState#state{keepalive=Keepalive});
+		M={ftp_closed, Socket} ->
+			lftpc_prim:setopts(Socket, [{active, Active}]),
+			{noreply, NewState} = handle_info(M, State),
+			NewState;
+		M={ftp_error, Socket, _Reason} ->
+			lftpc_prim:setopts(Socket, [{active, Active}]),
+			{noreply, NewState} = handle_info(M, State),
+			NewState
+	end.
+
+%% @private
+keepalive_flush(KRef) ->
+	receive
+		{timeout, KRef, keepalive} ->
+			keepalive_flush(KRef)
+	after
+		0 ->
+			ok
+	end.
+
+%% @private
+keepalive_start(State=#state{keepalive=Keepalive, kref=undefined}) when is_integer(Keepalive) ->
+	KRef = erlang:start_timer(Keepalive, self(), keepalive),
+	State#state{kref=KRef};
+keepalive_start(State=#state{keepalive=true, kref=undefined}) ->
+	KRef = erlang:start_timer(?KEEPALIVE, self(), keepalive),
+	State#state{kref=KRef};
+keepalive_start(State=#state{kref=undefined}) ->
+	State;
+keepalive_start(State) ->
+	keepalive_start(keepalive_stop(State)).
+
+%% @private
+keepalive_stop(State=#state{kref=undefined}) ->
+	State;
+keepalive_stop(State=#state{kref=KRef}) ->
+	catch erlang:cancel_timer(KRef),
+	ok = keepalive_flush(KRef),
+	State#state{kref=undefined}.
 
 %%%-------------------------------------------------------------------
 %%% Internal functions
