@@ -6,18 +6,33 @@
 
 %% ct.
 -export([all/0]).
-% -export([groups/0]).
+-export([groups/0]).
 -export([init_per_suite/1]).
 -export([end_per_suite/1]).
-% -export([init_per_group/2]).
-% -export([end_per_group/2]).
+-export([init_per_group/2]).
+-export([end_per_group/2]).
 
 %% Tests.
--export([smoke/1]).
+-export([ftp/1]).
+-export([ftp_explicit/1]).
+-export([ftp_implicit/1]).
 
 all() ->
 	[
-		smoke
+		{group, mozilla},
+		{group, rebex}
+	].
+
+groups() ->
+	[
+		{mozilla, [parallel], [
+			ftp
+		]},
+		{rebex, [parallel], [
+			ftp,
+			ftp_explicit,
+			ftp_implicit
+		]}
 	].
 
 init_per_suite(Config) ->
@@ -28,17 +43,66 @@ end_per_suite(_Config) ->
 	application:stop(lftpc),
 	ok.
 
+init_per_group(mozilla, Config) ->
+	[
+		{ftp_host, "ftp.mozilla.org"},
+		{ftp_credentials, anonymous}
+		| Config
+	];
+init_per_group(rebex, Config) ->
+	[
+		{ftp_host, "test.rebex.net"},
+		{ftp_credentials, [
+			{username, <<"demo">>},
+			{password, <<"password">>}
+		]}
+		| Config
+	].
+
+end_per_group(_Group, _Config) ->
+	ok.
+
 %%====================================================================
 %% Tests
 %%====================================================================
 
+ftp(Config) ->
+	Host = ?config(ftp_host, Config),
+	Credentials = ?config(ftp_credentials, Config),
+	ftp_smoke(Host, 21, Credentials, []).
+
+ftp_explicit(Config) ->
+	Host = ?config(ftp_host, Config),
+	Credentials = ?config(ftp_credentials, Config),
+	ftp_smoke(Host, 21, Credentials, [{tls, explicit}]).
+
+ftp_implicit(Config) ->
+	Host = ?config(ftp_host, Config),
+	Credentials = ?config(ftp_credentials, Config),
+	ftp_smoke(Host, 990, Credentials, [{tls, implicit}]).
+
+%%%-------------------------------------------------------------------
+%%% Internal functions
+%%%-------------------------------------------------------------------
+
 -define(FTP_TIMEOUT, 10000).
 
-smoke(_Config) ->
-	{ok, {_, Socket}} = lftpc:connect("ftp.mozilla.org", 21, []),
-	{ok, _} = lftpc:login_anonymous(Socket, ?FTP_TIMEOUT, []),
+%% @private
+ftp_smoke(Host, Port, Credentials, Options) ->
+	{ok, {_, Socket}} = lftpc:connect(Host, Port, Options),
+	{ok, _} = case Credentials of
+		anonymous ->
+			lftpc:login_anonymous(Socket, ?FTP_TIMEOUT, []);
+		_ ->
+			lftpc:login(Socket, Credentials, ?FTP_TIMEOUT, [])
+	end,
 	{ok, _} = lftpc:cd(Socket, <<"pub">>, ?FTP_TIMEOUT, []),
 	{ok, _R} = lftpc:nlist(Socket, ?FTP_TIMEOUT, []),
 	{ok, _} = lftpc:disconnect(Socket, ?FTP_TIMEOUT, []),
 	ok = lftpc:close(Socket),
+	erlang:monitor(process, Socket),
+	ok = receive
+		{'DOWN', _, process, Socket, _} ->
+			ok
+	end,
 	ok.

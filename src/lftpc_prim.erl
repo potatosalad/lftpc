@@ -44,11 +44,14 @@
 -export([reply_wait_transfer/1]).
 -export([opening/1]).
 -export([transfer/1]).
+-export([closed/1]).
 
 %% sys callbacks
 -export([system_continue/3]).
 -export([system_terminate/4]).
 -export([system_code_change/4]).
+-export([system_get_state/1]).
+-export([system_replace_state/2]).
 
 -record(state_data, {
 	owner   = undefined :: undefined | pid(),
@@ -105,20 +108,22 @@
 %%% API functions
 %%%===================================================================
 
--spec call(Socket, Command) -> {ok, CallRef} | {error, einval}
+-spec call(Socket, Command) -> {ok, CallRef} | {error, Reason}
 	when
 		Socket  :: socket(),
 		Command :: binary(),
-		CallRef :: reference().
+		CallRef :: reference(),
+		Reason  :: now_owner | einval.
 call(Socket, Command) ->
 	?CALL(Socket, {ctrl, [Command]}).
 
--spec call(Socket, Command, Argument) -> {ok, CallRef} | {error, einval}
+-spec call(Socket, Command, Argument) -> {ok, CallRef} | {error, Reason}
 	when
 		Socket   :: socket(),
 		Command  :: binary(),
 		Argument :: iodata(),
-		CallRef  :: reference().
+		CallRef  :: reference(),
+		Reason   :: now_owner | einval.
 call(Socket, Command, Argument) ->
 	?CALL(Socket, {ctrl, [Command, Argument]}).
 
@@ -272,7 +277,8 @@ handle(SD0, SN, {To, Tag}, {send, Packet})
 	SD1 = data_send(SD0, Packet),
 	To ! {Tag, ok},
 	?MODULE:SN(SD1);
-handle(SD, SN, {To, Tag}, {send, _}) ->
+handle(SD, SN, {To, Tag}, {send, _})
+		when SN =/= closed ->
 	To ! {Tag, {error, nodata}},
 	?MODULE:SN(SD);
 handle(SD0, SN, {To, Tag}, {sendfile, Filename, Offset, Bytes, Opts})
@@ -306,7 +312,8 @@ handle(SD0, SN, {To, Tag}, done)
 	SD1 = SD0#state_data{ddone=immediate},
 	To ! {Tag, ok},
 	?MODULE:SN(SD1);
-handle(SD, SN, {To, Tag}, done) ->
+handle(SD, SN, {To, Tag}, done)
+		when SN =/= closed ->
 	To ! {Tag, {error, nodata}},
 	?MODULE:SN(SD);
 handle(SD0, SN0, {To, Tag}, {ctrl, [Command | Argument]})
@@ -327,7 +334,8 @@ handle(SD0, SN0, {To, Tag}, {ctrl, [Command | Argument]})
 		idle_transfer ->
 			?MODULE:reply_wait_transfer(SD3)
 	end;
-handle(SD0=#state_data{cwait=CWait0}, SN, From, R={ctrl, _}) ->
+handle(SD0=#state_data{cwait=CWait0}, SN, From, R={ctrl, _})
+		when SN =/= closed ->
 	CWait1 = queue:in({From, R}, CWait0),
 	SD1 = SD0#state_data{cwait=CWait1},
 	?MODULE:SN(SD1);
@@ -343,11 +351,13 @@ handle(SD0=#state_data{cwait=CWait0}, connecting, From, R)
 	CWait1 = queue:in({From, R}, CWait0),
 	SD1 = SD0#state_data{cwait=CWait1},
 	?MODULE:connecting(SD1);
-handle(SD=#state_data{csocket=CSocket, ctransport=CTransport}, SN, {To, Tag}, peername) ->
+handle(SD=#state_data{csocket=CSocket, ctransport=CTransport}, SN, {To, Tag}, peername)
+		when SN =/= closed ->
 	Reply = CTransport:peername(CSocket),
 	To ! {Tag, Reply},
 	before_loop(SD, SN);
-handle(SD=#state_data{csocket=CSocket, ctransport=CTransport}, SN, {To, Tag}, sockname) ->
+handle(SD=#state_data{csocket=CSocket, ctransport=CTransport}, SN, {To, Tag}, sockname)
+		when SN =/= closed ->
 	Reply = CTransport:sockname(CSocket),
 	To ! {Tag, Reply},
 	before_loop(SD, SN);
@@ -355,7 +365,11 @@ handle(SD0, SN, {To, Tag}, close) ->
 	SD1 = data_clean(SD0),
 	SD2 = ctrl_close(SD1),
 	To ! {Tag, ok},
-	terminate(SD2, SN, normal).
+	terminate(SD2, SN, normal);
+handle(SD, closed, {To, Tag}, _) ->
+	Reply = {error, closed},
+	To ! {Tag, Reply},
+	?MODULE:closed(SD).
 
 %% @private
 shutdown(SD0, SN, Reason) ->
@@ -395,7 +409,8 @@ connecting(SD0=#state_data{owner=Owner, ctrl=Ctrl}) ->
 			end,
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, connecting, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, connecting, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, connecting, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -419,11 +434,13 @@ ready_wait(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocke
 			ctrl_parse(SD0, ready_wait, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, ready_wait, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, ready_wait, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, ready_wait, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, ready_wait, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, ready_wait, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -447,11 +464,13 @@ idle(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=CSoc
 			ctrl_parse(SD0, idle, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, idle, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, idle, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, idle, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, idle, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, idle, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -463,8 +482,8 @@ idle(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=CSoc
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {idle, SD0});
 		Info ->
 			error_logger:error_msg(
-				"FTP client ~p received unexpected message ~p in state ~p ~p~n",
-				[self(), Info, idle, SD0])
+				"FTP client ~p received unexpected message ~p in state ~p~n",
+				[self(), Info, idle])
 	end.
 
 %% @private
@@ -475,11 +494,13 @@ idle_opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csoc
 			ctrl_parse(SD0, idle_opening, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, idle_opening, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, idle_opening, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, idle_opening, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, idle_opening, normal);
 		{socket, Data, DTransport, DSocket, DSocketRef} ->
 			Data ! DSocketRef,
 			ok = receive
@@ -507,7 +528,8 @@ idle_opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csoc
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, DReason}}),
 			SD2 = data_clean(SD1),
 			SD3 = ctrl_close(SD2),
-			terminate(SD3, idle_opening, normal);
+			before_loop(SD3, closed);
+			% terminate(SD3, idle_opening, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, idle_opening, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -531,11 +553,13 @@ idle_transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, cso
 			ctrl_parse(SD0, idle_transfer, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, idle_transfer, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, idle_transfer, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, idle_transfer, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, idle_transfer, normal);
 		{DOK, DSocket, DData} ->
 			data_parse(SD0, idle_transfer, DData);
 		{DClosed, DSocket} ->
@@ -545,7 +569,8 @@ idle_transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, cso
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, DReason}}),
 			SD2 = data_clean(SD1),
 			SD3 = ctrl_close(SD2),
-			terminate(SD3, idle_transfer, normal);
+			before_loop(SD3, closed);
+			% terminate(SD3, idle_transfer, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, idle_transfer, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -569,11 +594,13 @@ reply_wait(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocke
 			ctrl_parse(SD0, reply_wait, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, reply_wait, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, reply_wait, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, reply_wait, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, reply_wait, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, reply_wait, From, Request);
 		{force, Packet} ->
@@ -601,11 +628,13 @@ reply_wait_opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}
 			ctrl_parse(SD0, reply_wait_opening, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, reply_wait_opening, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, reply_wait_opening, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, reply_wait_opening, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, reply_wait_opening, normal);
 		{socket, Data, DTransport, DSocket, DSocketRef} ->
 			Data ! DSocketRef,
 			ok = receive
@@ -642,7 +671,8 @@ reply_wait_opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, DReason}}),
 			SD2 = data_clean(SD1),
 			SD3 = ctrl_close(SD2),
-			terminate(SD3, reply_wait_opening, normal);
+			before_loop(SD3, closed);
+			% terminate(SD3, reply_wait_opening, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, reply_wait_opening, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -666,11 +696,13 @@ reply_wait_transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError
 			ctrl_parse(SD0, reply_wait_transfer, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, reply_wait_transfer, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, reply_wait_transfer, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, reply_wait_transfer, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, reply_wait_transfer, normal);
 		{DOK, DSocket, DData} ->
 			data_parse(SD0, reply_wait_transfer, DData);
 		{DClosed, DSocket} ->
@@ -680,7 +712,8 @@ reply_wait_transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, DReason}}),
 			SD2 = data_clean(SD1),
 			SD3 = ctrl_close(SD2),
-			terminate(SD3, reply_wait_transfer, normal);
+			before_loop(SD3, closed);
+			% terminate(SD3, reply_wait_transfer, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, reply_wait_transfer, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -704,11 +737,13 @@ opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=C
 			ctrl_parse(SD0, opening, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, opening, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, opening, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, opening, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, opening, normal);
 		{socket, Data, DTransport, DSocket, DSocketRef} ->
 			Data ! DSocketRef,
 			ok = receive
@@ -746,7 +781,8 @@ opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=C
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, DReason}}),
 			SD2 = data_clean(SD1),
 			SD3 = ctrl_close(SD2),
-			terminate(SD3, opening, normal);
+			before_loop(SD3, closed);
+			% terminate(SD3, opening, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, opening, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -775,11 +811,13 @@ transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=
 			ctrl_parse(SD0, transfer, CData);
 		{CClosed, CSocket} ->
 			SD1 = ctrl_close(SD0),
-			terminate(SD1, transfer, normal);
+			before_loop(SD1, closed);
+			% terminate(SD1, transfer, normal);
 		{CError, CSocket, CReason} ->
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, CReason}}),
 			SD2 = ctrl_close(SD1),
-			terminate(SD2, transfer, normal);
+			before_loop(SD2, closed);
+			% terminate(SD2, transfer, normal);
 		{DOK, DSocket, DData} ->
 			data_parse(SD0, transfer, DData);
 		{DClosed, DSocket} ->
@@ -790,7 +828,8 @@ transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=
 			SD1 = owner_send(SD0, {ftp_error, self(), {SD0#state_data.cref, DReason}}),
 			SD2 = data_clean(SD1),
 			SD3 = ctrl_close(SD2),
-			terminate(SD3, transfer, normal);
+			before_loop(SD3, closed);
+			% terminate(SD3, transfer, normal);
 		{'$gen_call', From={Owner, _}, Request} ->
 			handle(SD0, transfer, From, Request);
 		{'$gen_call', {To, Tag}, _} ->
@@ -811,6 +850,26 @@ transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=
 				[self(), Info, transfer])
 	end.
 
+%% @private
+closed(SD0=#state_data{rcvbuf={[],[]}}) ->
+	terminate(SD0, closed, normal);
+closed(SD0=#state_data{owner=Owner}) ->
+	receive
+		{'$gen_call', From={Owner, _}, Request} ->
+			handle(SD0, closed, From, Request);
+		{'$gen_call', {To, Tag}, _} ->
+			To ! {Tag, {error, now_owner}},
+			closed(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, closed, normal);
+		{system, From, Request} ->
+			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {closed, SD0});
+		Info ->
+			error_logger:error_msg(
+				"FTP client ~p received unexpected message ~p in state ~p~n",
+				[self(), Info, closed])
+	end.
+
 %%%===================================================================
 %%% sys callbacks
 %%%===================================================================
@@ -823,6 +882,13 @@ system_terminate(Reason, _, _, {SN, SD}) ->
 
 system_code_change(Misc, _, _, _) ->
 	{ok, Misc}.
+
+system_get_state({SN, SD}) ->
+	{ok, {SN, SD}}.
+
+system_replace_state(StateFun, {SN0, SD0}) ->
+	Result = {SN1, SD1} = StateFun({SN0, SD0}),
+	{ok, Result, {SN1, SD1}}.
 
 %%%-------------------------------------------------------------------
 %%% Control functions
@@ -971,11 +1037,13 @@ ctrl_prep(SD, SN, _, Argument) ->
 	{SD, SN, [$\s, Argument, $\r, $\n]}.
 
 %% @private
-ctrl_process(SD0, SN, R={421, _}) ->
-	SD1 = ctrl_recv(SD0, R),
-	SD2 = ctrl_done(SD1),
-	SD3 = ctrl_close(SD2),
-	terminate(SD3, SN, normal);
+ctrl_process(SD0, _SN, R={421, _}) ->
+	SD1 = data_clean(SD0),
+	SD2 = ctrl_recv(SD1, R),
+	SD3 = ctrl_done(SD2),
+	SD4 = ctrl_close(SD3),
+	before_loop(SD4, closed);
+	% terminate(SD3, SN, normal);
 ctrl_process(SD0, SN=reply_wait_transfer, R={C, _})
 		when C =:= 125
 		orelse C =:= 150 ->
@@ -1593,8 +1661,10 @@ owner_flush(SD0=#state_data{active=once, owner=Owner, rcvbuf=Rcvbuf}) ->
 	case queue:out(Rcvbuf) of
 		{{value, Message}, NewRcvbuf} ->
 			Owner ! Message,
-			SD1 = SD0#state_data{active=false, rcvbuf=NewRcvbuf},
-			SD1;
+			SD1 = SD0#state_data{active=true, rcvbuf=NewRcvbuf},
+			SD2 = owner_flush(SD1),
+			SD3 = SD2#state_data{active=false},
+			SD3;
 		{empty, Rcvbuf} ->
 			SD0
 	end;

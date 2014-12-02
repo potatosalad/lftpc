@@ -13,8 +13,16 @@
 -include("lftpc_types.hrl").
 
 %% API exports
--export([close/1]).
 -export([request/6]).
+-export([send_data_part/2]).
+-export([send_data_part/3]).
+
+%% Socket API
+-export([close/1]).
+-export([getopts/2]).
+-export([peername/1]).
+-export([setopts/2]).
+-export([sockname/1]).
 
 %% Utility API
 -export([require/1]).
@@ -114,13 +122,70 @@
 %% API functions
 %%====================================================================
 
-close(Socket) ->
-	lftpc_sock:close(Socket).
-
 request(Socket, Command, Argument, Data, Timeout, Options) ->
 	ok = verify_options(Options, []),
 	SendRetry = proplists:get_value(send_retry, Options, 1),
 	do_request_retry(Socket, Command, Argument, Data, Timeout, Options, SendRetry).
+
+send_data_part({Client, Window}, Data) ->
+	send_data_part({Client, Window}, Data, infinity).
+
+send_data_part({Client, _Window}, ftp_eod, _Timeout)
+		when is_pid(Client) ->
+	Client ! {data_part, self(), ftp_eod},
+	ok = ack_flush(Client),
+	{ok, Client};
+send_data_part({Client, 0}, Data, Timeout)
+		when is_pid(Client) ->
+	receive
+		{ack, Client} ->
+			send_data_part({Client, 1}, Data, Timeout)
+	after
+		Timeout ->
+			kill_client(Client)
+	end;
+send_data_part({Client, infinity}, Data, _Timeout)
+		when is_pid(Client) ->
+	Client ! {data_part, self(), Data},
+	ok = receive
+		{ack, Client} ->
+			ok
+	after
+		0 ->
+			ok
+	end,
+	{ok, {Client, infinity}};
+send_data_part({Client, Window}, Data, _Timeout)
+		when is_pid(Client)
+		andalso is_integer(Window)
+		andalso Window > 0 ->
+	Client ! {data_part, self(), Data},
+	receive
+		{ack, Client} ->
+			{ok, {Client, Window}}
+	after
+		0 ->
+			{ok, {Client, Window - 1}}
+	end.
+
+%%====================================================================
+%% Socket API functions
+%%====================================================================
+
+close(Socket) ->
+	lftpc_sock:close(Socket).
+
+getopts(Socket, Options) ->
+	lftpc_sock:getopts(Socket, Options).
+
+peername(Socket) ->
+	lftpc_sock:peername(Socket).
+
+setopts(Socket, Options) ->
+	lftpc_sock:setopts(Socket, Options).
+
+sockname(Socket) ->
+	lftpc_sock:sockname(Socket).
 
 %%====================================================================
 %% Utility API functions
@@ -257,7 +322,7 @@ data_mode(Socket, Open)
 		orelse Open =:= passive
 		orelse Open =:= extended_active
 		orelse Open =:= extended_passive ->
-	gen_ftp:setopts(Socket, [{open, Open}]).
+	lftpc_sock:setopts(Socket, [{open, Open}]).
 
 delete(Socket, Filename, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
@@ -812,6 +877,16 @@ ftp_user(Socket, Username, Timeout, Options) ->
 %%%-------------------------------------------------------------------
 
 %% @private
+ack_flush(Client) ->
+	receive
+		{ack, Client} ->
+			ack_flush(Client)
+	after
+		0 ->
+			ok
+	end.
+
+%% @private
 -spec bad_options([term()]) -> no_return().
 bad_options(Errors) ->
 	erlang:error({bad_options, Errors}).
@@ -942,8 +1017,8 @@ kill_client_after(Pid, Timeout) ->
 				{'DOWN', Monitor, process, Pid, Reason} ->
 					erlang:error(Reason)
 			after
-				1000 ->
-					% exit(Pid, kill),
+				5000 ->
+					exit(Pid, kill),
 					exit(normal)
 			end
 	end.

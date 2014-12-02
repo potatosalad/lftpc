@@ -45,8 +45,9 @@
 -record(state, {
 	owner  = undefined :: undefined | pid(),
 	socket = undefined :: undefined | lftpc_prim:socket(),
-	req    = undefined :: undefined | {term(), pid()},
+	req    = undefined :: undefined | {term(), pid(), reference()},
 	die    = undefined :: undefined | term(),
+	closed = false     :: boolean(),
 	% Buffers
 	rcvbuf = undefined :: undefined | queue:queue(term()),
 	% Options
@@ -199,8 +200,30 @@ init({Owner, Address, Port, Options, Timeout}) ->
 	end.
 
 %% @private
+handle_call(close, {Owner, _}, State=#state{owner=Owner, socket=Socket}) ->
+	Reply = lftpc_prim:close(Socket),
+	{stop, normal, Reply, State};
+handle_call({getopts, Options}, {Owner, _}, State=#state{owner=Owner, closed=true}) ->
+	{Reply, NewState} = options_get(Options, State),
+	{reply, Reply, NewState};
+handle_call({setopts, Options}, {Owner, _}, State=#state{owner=Owner, closed=true}) ->
+	{Reply, NewState} = options_set(Options, State),
+	case queue:is_empty(NewState#state.rcvbuf) of
+		false ->
+			{reply, Reply, NewState};
+		true ->
+			case NewState#state.die of
+				undefined ->
+					{stop, normal, Reply, NewState};
+				Reason ->
+					{stop, Reason, Reply, NewState}
+			end
+	end;
+handle_call(_Request, {Owner, _}, State=#state{owner=Owner, closed=true}) ->
+	Reply = {error, closed},
+	{reply, Reply, State};
 handle_call(start_request, {Owner, _}, State=#state{owner=Owner, req=undefined, socket=Socket}) ->
-	catch lftpc_prim:setopts(Socket, [{active, false}]),
+	lftpc_prim:setopts(Socket, [{active, false}]),
 	case process_remaining(State) of
 		{noreply, NewState} ->
 			ReqId = erlang:now(),
@@ -208,7 +231,9 @@ handle_call(start_request, {Owner, _}, State=#state{owner=Owner, req=undefined, 
 				{ok, Pid} ->
 					case lftpc_prim:controlling_process(Socket, Pid) of
 						ok ->
-							{reply, {ok, {ReqId, Pid}}, NewState#state{req={ReqId, Pid}}};
+							Mon = erlang:monitor(process, Pid),
+							erlang:unlink(Pid),
+							{reply, {ok, {ReqId, Pid}}, NewState#state{req={ReqId, Pid, Mon}}};
 						ControlError ->
 							erlang:monitor(process, Pid),
 							erlang:unlink(Pid),
@@ -234,9 +259,6 @@ handle_call({call, Command}, {Owner, _}, State=#state{owner=Owner, socket=Socket
 handle_call({call, Command, Argument}, {Owner, _}, State=#state{owner=Owner, socket=Socket}) ->
 	Reply = lftpc_prim:call(Socket, Command, Argument),
 	{reply, Reply, keepalive_stop(State)};
-handle_call(close, {Owner, _}, State=#state{owner=Owner, socket=Socket}) ->
-	Reply = lftpc_prim:close(Socket),
-	{reply, Reply, State};
 handle_call(done, {Owner, _}, State=#state{owner=Owner, socket=Socket}) ->
 	Reply = lftpc_prim:done(Socket),
 	{reply, Reply, State};
@@ -293,30 +315,34 @@ handle_info({ftp, Socket, Message}, State=#state{socket=Socket}) ->
 			{noreply, NewState}
 	end;
 handle_info({ftp_closed, Socket}, State=#state{socket=Socket}) ->
-	NewState = owner_send(State, {ftp_closed, self()}),
+	NewState = owner_send(State#state{closed=true}, {ftp_closed, self()}),
 	{noreply, NewState};
 handle_info({ftp_error, Socket, Reason}, State=#state{socket=Socket}) ->
 	NewState = owner_send(State, {ftp_error, self(), Reason}),
-	{noreply, NewState};
-handle_info({'EXIT', Socket, Reason}, State=#state{socket=Socket, req=undefined}) ->
-	{stop, Reason, State};
+	maybe_shutdown(NewState#state{closed=true, die=Reason});
 handle_info({'EXIT', Socket, Reason}, State=#state{socket=Socket}) ->
-	{noreply, State#state{die=Reason}};
+	maybe_shutdown(State#state{closed=true, die=Reason});
 handle_info({'EXIT', Owner, _Reason}, State=#state{owner=Owner}) ->
 	{stop, normal, State};
-handle_info({response, ReqId, Pid, Socket}, State=#state{req={ReqId, Pid}, socket=Socket, active=Active}) ->
-	erlang:monitor(process, Pid),
-	erlang:unlink(Pid),
+handle_info({'DOWN', Mon, process, Pid, _Reason}, State=#state{req={_ReqId, Pid, Mon}, socket=Socket, active=Active}) ->
+	lftpc_prim:setopts(Socket, [{active, Active}]),
+	case maybe_shutdown(State#state{req=undefined}) of
+		{noreply, NewState} ->
+			{noreply, keepalive_start(NewState)};
+		Other ->
+			Other
+	end;
+handle_info({response, ReqId, Pid, Socket}, State=#state{req={ReqId, Pid, Mon}, socket=Socket, active=Active}) ->
 	ok = receive
-		{'DOWN', _, process, Pid, _} ->
+		{'DOWN', Mon, process, Pid, _} ->
 			ok
 	end,
-	catch lftpc_prim:setopts(Socket, [{active, Active}]),
-	case State#state.die of
-		undefined ->
-			{noreply, keepalive_start(State#state{req=undefined})};
-		Reason ->
-			{stop, Reason, State}
+	lftpc_prim:setopts(Socket, [{active, Active}]),
+	case maybe_shutdown(State#state{req=undefined}) of
+		{noreply, NewState} ->
+			{noreply, keepalive_start(NewState)};
+		Other ->
+			Other
 	end;
 handle_info({timeout, KRef, keepalive}, State=#state{kref=KRef, req=undefined, socket=Socket})
 		when is_reference(KRef) ->
@@ -352,7 +378,8 @@ owner_flush(State=#state{rcvbuf={[],[]}}) ->
 owner_flush(State=#state{active=once, owner=Owner, rcvbuf=Rcvbuf}) ->
 	{{value, Message}, NewRcvbuf} = queue:out(Rcvbuf),
 	Owner ! Message,
-	State#state{active=false, rcvbuf=NewRcvbuf};
+	NewState = owner_flush(State#state{active=true, rcvbuf=NewRcvbuf}),
+	NewState#state{active=false};
 owner_flush(State=#state{active=true, owner=Owner, rcvbuf=Rcvbuf}) ->
 	{{value, Message}, NewRcvbuf} = queue:out(Rcvbuf),
 	Owner ! Message,
@@ -402,12 +429,18 @@ options_set([{active, Active} | Options], State=#state{socket=Socket})
 		when Active =:= false
 		orelse Active =:= once
 		orelse Active =:= true ->
-	case lftpc_prim:setopts(Socket, [{active, Active}]) of
-		ok ->
+	case erlang:is_process_alive(Socket) of
+		false ->
 			NewState = options_set_active(Active, State),
 			options_set(Options, NewState);
-		Error ->
-			{Error, State}
+		true ->
+			case lftpc_prim:setopts(Socket, [{active, Active}]) of
+				ok ->
+					NewState = options_set_active(Active, State),
+					options_set(Options, NewState);
+				Error ->
+					{Error, State}
+			end
 	end;
 options_set([{keepalive, Keepalive} | Options], State)
 		when Keepalive =:= false
@@ -467,7 +500,9 @@ keepalive_check(CRef, State=#state{keepalive=Keepalive, socket=Socket, active=Ac
 		M={ftp_error, Socket, _Reason} ->
 			lftpc_prim:setopts(Socket, [{active, Active}]),
 			{noreply, NewState} = handle_info(M, State),
-			NewState
+			NewState;
+		Info ->
+			handle_info(Info, State)
 	end.
 
 %% @private
@@ -481,6 +516,8 @@ keepalive_flush(KRef) ->
 	end.
 
 %% @private
+keepalive_start(State=#state{closed=true}) ->
+	keepalive_stop(State);
 keepalive_start(State=#state{keepalive=Keepalive, kref=undefined}) when is_integer(Keepalive) ->
 	KRef = erlang:start_timer(Keepalive, self(), keepalive),
 	State#state{kref=KRef};
@@ -511,6 +548,22 @@ get_value(Key, Opts, Default) ->
 		{_, Value} -> Value;
 		_ -> Default
 	end.
+
+%% @private
+maybe_shutdown(State=#state{closed=true, req=undefined, rcvbuf={[],[]}, socket=Socket}) ->
+	case erlang:is_process_alive(Socket) of
+		false ->
+			case State#state.die of
+				undefined ->
+					{stop, normal, State};
+				Reason ->
+					{stop, Reason, State}
+			end;
+		true ->
+			{noreply, State}
+	end;
+maybe_shutdown(State) ->
+	{noreply, State}.
 
 %% @private
 process_remaining(State=#state{socket=Socket}) ->
