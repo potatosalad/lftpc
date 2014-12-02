@@ -41,10 +41,12 @@
 -export([terminate/2]).
 -export([code_change/3]).
 
+%% Records
 -record(state, {
 	owner  = undefined :: undefined | pid(),
 	socket = undefined :: undefined | lftpc_prim:socket(),
 	req    = undefined :: undefined | {term(), pid()},
+	die    = undefined :: undefined | term(),
 	% Buffers
 	rcvbuf = undefined :: undefined | queue:queue(term()),
 	% Options
@@ -54,30 +56,44 @@
 	open      = passive   :: passive | active
 }).
 
--define(KEEPALIVE, 60000). %% timer:minutes(1).
+%% Types
+-type socket() :: pid().
+-export_type([socket/0]).
+
+%% Macros
+-define(KEEPALIVE, 30000). %% timer:seconds(30).
+
+-define(CALL(Socket, Request, Error),
+	try
+		gen_server:call(Socket, Request, infinity)
+	catch
+		exit:{noproc, _} ->
+			Error
+	end).
+
+-define(CALL(Socket, Request), ?CALL(Socket, Request, {error, einval})).
 
 %%%===================================================================
 %%% API functions
 %%%===================================================================
 
 call(Socket, Command) ->
-	do_call(Socket, {call, Command}).
+	?CALL(Socket, {call, Command}).
 
 call(Socket, Command, Argument) ->
-	do_call(Socket, {call, Command, Argument}).
+	?CALL(Socket, {call, Command, Argument}).
 
+-spec close(Socket) -> ok
+	when
+		Socket :: socket().
 close(Socket) ->
-	case erlang:is_process_alive(Socket) of
-		false ->
-			receive
-				{ftp_closed, Socket} ->
-					ok
-			after
-				0 ->
-					ok
-			end;
-		true ->
-			do_call(Socket, close)
+	ok = ?CALL(Socket, close, ok),
+	receive
+		{ftp_closed, Socket} ->
+			ok
+	after
+		0 ->
+			ok
 	end.
 
 connect(Address, Port, Options) ->
@@ -105,7 +121,9 @@ controlling_process(Socket, NewOwner) ->
 							try setopts(Socket, [{active, OldActive}, {owner, NewOwner}]) of
 								ok ->
 									erlang:unlink(Socket),
-									ok
+									ok;
+								{error, Reason} ->
+									{error, Reason}
 							catch
 								error:Reason ->
 									{error, Reason}
@@ -117,37 +135,37 @@ controlling_process(Socket, NewOwner) ->
 	end.
 
 done(Socket) ->
-	do_call(Socket, done).
+	?CALL(Socket, done).
 
 getopts(Socket, Options) ->
-	do_call(Socket, {getopts, Options}).
+	?CALL(Socket, {getopts, Options}).
 
 open(Socket) ->
-	do_call(Socket, open).
+	?CALL(Socket, open).
 
 peername(Socket) ->
-	do_call(Socket, peername).
+	?CALL(Socket, peername).
 
 send(Socket, Packet) ->
-	do_call(Socket, {send, Packet}).
+	?CALL(Socket, {send, Packet}).
 
 sendfile(Socket, Filename) ->
-	do_call(Socket, {sendfile, Filename}).
+	?CALL(Socket, {sendfile, Filename}).
 
 sendfile(Socket, Filename, Offset, Bytes) ->
-	do_call(Socket, {sendfile, Filename, Offset, Bytes}).
+	?CALL(Socket, {sendfile, Filename, Offset, Bytes}).
 
 sendfile(Socket, Filename, Offset, Bytes, Opts) ->
-	do_call(Socket, {sendfile, Filename, Offset, Bytes, Opts}).
+	?CALL(Socket, {sendfile, Filename, Offset, Bytes, Opts}).
 
 setopts(Socket, Options) ->
-	do_call(Socket, {setopts, Options}).
+	?CALL(Socket, {setopts, Options}).
 
 sockname(Socket) ->
-	do_call(Socket, sockname).
+	?CALL(Socket, sockname).
 
 start_request(Socket) ->
-	do_call(Socket, start_request).
+	?CALL(Socket, start_request).
 
 %%%===================================================================
 %%% Internal API functions
@@ -188,7 +206,7 @@ handle_call(start_request, {Owner, _}, State=#state{owner=Owner, req=undefined, 
 			ReqId = erlang:now(),
 			case lftpc_client:start_request(ReqId, Socket, Owner) of
 				{ok, Pid} ->
-					case lftpc_sock:controlling_process(Socket, Pid) of
+					case lftpc_prim:controlling_process(Socket, Pid) of
 						ok ->
 							{reply, {ok, {ReqId, Pid}}, NewState#state{req={ReqId, Pid}}};
 						ControlError ->
@@ -280,8 +298,12 @@ handle_info({ftp_closed, Socket}, State=#state{socket=Socket}) ->
 handle_info({ftp_error, Socket, Reason}, State=#state{socket=Socket}) ->
 	NewState = owner_send(State, {ftp_error, self(), Reason}),
 	{noreply, NewState};
-handle_info({'EXIT', Socket, Reason}, State=#state{socket=Socket}) ->
+handle_info({'EXIT', Socket, Reason}, State=#state{socket=Socket, req=undefined}) ->
 	{stop, Reason, State};
+handle_info({'EXIT', Socket, Reason}, State=#state{socket=Socket}) ->
+	{noreply, State#state{die=Reason}};
+handle_info({'EXIT', Owner, _Reason}, State=#state{owner=Owner}) ->
+	{stop, normal, State};
 handle_info({response, ReqId, Pid, Socket}, State=#state{req={ReqId, Pid}, socket=Socket, active=Active}) ->
 	erlang:monitor(process, Pid),
 	erlang:unlink(Pid),
@@ -289,8 +311,13 @@ handle_info({response, ReqId, Pid, Socket}, State=#state{req={ReqId, Pid}, socke
 		{'DOWN', _, process, Pid, _} ->
 			ok
 	end,
-	lftpc_prim:setopts(Socket, [{active, Active}]),
-	{noreply, keepalive_start(State#state{req=undefined})};
+	catch lftpc_prim:setopts(Socket, [{active, Active}]),
+	case State#state.die of
+		undefined ->
+			{noreply, keepalive_start(State#state{req=undefined})};
+		Reason ->
+			{stop, Reason, State}
+	end;
 handle_info({timeout, KRef, keepalive}, State=#state{kref=KRef, req=undefined, socket=Socket})
 		when is_reference(KRef) ->
 	case lftpc_prim:call(Socket, <<"NOOP">>) of
@@ -303,8 +330,8 @@ handle_info({timeout, KRef, keepalive}, State=#state{kref=KRef})
 handle_info(Info, State) ->
 	error_logger:error_msg(
 		"** ~p ~p unhandled info in ~p/~p~n"
-		"   Info was: ~p~n",
-		[?MODULE, self(), handle_info, 2, Info]),
+		"   Info was: ~p ~p~n",
+		[?MODULE, self(), handle_info, 2, Info, State]),
 	{noreply, State}.
 
 %% @private
@@ -423,9 +450,9 @@ options_set_active(Active, State) ->
 keepalive_check(CRef, State=#state{keepalive=Keepalive, socket=Socket, active=Active}) ->
 	lftpc_prim:setopts(Socket, [{active, once}]),
 	receive
-		{ftp, Socket, {CRef, M={Code, _}}} when Code >= 100 andalso Code < 200 ->
+		{ftp, Socket, {CRef, {Code, _}}} when Code >= 100 andalso Code < 200 ->
 			keepalive_check(CRef, State);
-		{ftp, Socket, {CRef, M={Code, _}}} when Code >= 200 ->
+		{ftp, Socket, {CRef, {Code, _}}} when Code >= 200 ->
 			keepalive_check(CRef, State);
 		{ftp, Socket, {CRef, done}} ->
 			lftpc_prim:setopts(Socket, [{active, Active}]),
@@ -476,10 +503,6 @@ keepalive_stop(State=#state{kref=KRef}) ->
 %%%-------------------------------------------------------------------
 %%% Internal functions
 %%%-------------------------------------------------------------------
-
-%% @private
-do_call(Socket, Request) ->
-	gen_server:call(Socket, Request, infinity).
 
 %% Faster alternative to proplists:get_value/3.
 %% @private

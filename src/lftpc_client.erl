@@ -19,19 +19,32 @@
 %% Internal API exports
 -export([init/4]).
 
+%% Records
 -record(state, {
 	parent           = undefined :: undefined | pid(),
 	owner            = undefined :: undefined | pid(),
 	stream_to        = undefined :: undefined | pid(),
 	req_id           = undefined :: undefined | term(),
 	req_ref          = undefined :: undefined | reference(),
-	socket           = undefined :: undefined | lftpc_sock:socket(),
+	socket           = undefined :: undefined | lftpc_prim:socket(),
 	partial_upload   = undefined :: undefined | boolean(),
 	upload_window    = undefined :: undefined | non_neg_integer() | infinity,
 	partial_download = undefined :: undefined | boolean(),
 	download_window  = undefined :: undefined | non_neg_integer() | infinity,
 	part_size        = undefined :: undefined | non_neg_integer() | infinity
 }).
+
+%% Macros
+-define(setactive(Socket, NextOK, NextError),
+	try lftpc_prim:setopts(Socket, [{active, once}]) of
+		ok ->
+			NextOK;
+		_ ->
+			NextError
+	catch
+		_:_ ->
+			NextError
+	end).
 
 %%====================================================================
 %% API functions
@@ -106,7 +119,7 @@ send_request(State=#state{socket=Socket}, Command, Argument, Data) ->
 	case do_call(Socket, Command, Argument) of
 		{ok, ReqRef} ->
 			lftpc_prim:setopts(Socket, [{active, once}]),
-			read_response_initial(State#state{req_ref=ReqRef}, Data)
+			read_response_initial(State#state{req_ref=ReqRef}, Data, [])
 	end.
 
 %% @private
@@ -119,11 +132,13 @@ do_call(Socket, Command, Argument) ->
 read_response(State=#state{req_ref=ReqRef, socket=Socket}, CAcc) ->
 	receive
 		{ftp, Socket, {ReqRef, {Code, Text}}} ->
-			lftpc_prim:setopts(Socket, [{active, once}]),
-			read_response(State, [{Code, Text} | CAcc]);
+			?setactive(Socket,
+				read_response(State, [{Code, Text} | CAcc]),
+				{ok, {lists:reverse([{Code, Text} | CAcc]), undefined}});
 		{ftp, Socket, {ReqRef, Data}} when is_binary(Data) ->
-			lftpc_prim:setopts(Socket, [{active, once}]),
-			read_response(State, CAcc);
+			?setactive(Socket,
+				read_response(State, CAcc),
+				{ok, {lists:reverse(CAcc), undefined}});
 		{ftp, Socket, {ReqRef, done}} ->
 			{ok, {lists:reverse(CAcc), undefined}}
 	end.
@@ -132,67 +147,86 @@ read_response(State=#state{req_ref=ReqRef, socket=Socket}, CAcc) ->
 read_response_data(State=#state{req_ref=ReqRef, socket=Socket}, {CAcc, DAcc}) ->
 	receive
 		{ftp, Socket, {ReqRef, {Code, Text}}} ->
-			lftpc_prim:setopts(Socket, [{active, once}]),
-			read_response_data(State, {[{Code, Text} | CAcc], DAcc});
+			?setactive(Socket,
+				read_response_data(State, {[{Code, Text} | CAcc], DAcc}),
+				{ok, {lists:reverse([{Code, Text} | CAcc]), lists:reverse(DAcc)}});
 		{ftp, Socket, {ReqRef, Data}} when is_binary(Data) ->
-			lftpc_prim:setopts(Socket, [{active, once}]),
-			read_response_data(State, {CAcc, [Data | DAcc]});
+			?setactive(Socket,
+				read_response_data(State, {CAcc, [Data | DAcc]}),
+				{ok, {lists:reverse(CAcc), lists:reverse([Data | DAcc])}});
 		{ftp, Socket, {ReqRef, done}} ->
 			{ok, {lists:reverse(CAcc), lists:reverse(DAcc)}}
 	end.
 
 %% @private
-read_response_initial(State=#state{req_ref=ReqRef, socket=Socket}, Data) ->
+read_response_initial(State=#state{req_ref=ReqRef, socket=Socket}, UploadData, DownloadData) ->
 	receive
 		{ftp, Socket, {ReqRef, {Code, Text}}} ->
 			case {State#state.partial_download, State#state.partial_upload} of
 				{false, false} ->
 					case Code of
 						_ when Code >= 100 andalso Code < 200 ->
-							case Data of
+							case UploadData of
 								undefined ->
-									lftpc_prim:setopts(Socket, [{active, once}]),
-									read_response_data(State, {[{Code, Text}], []});
+									?setactive(Socket,
+										read_response_data(State, {[{Code, Text}], DownloadData}),
+										{ok, {[{Code, Text}], undefined}});
 								_ ->
-									lftpc_prim:send(Socket, Data),
+									lftpc_prim:send(Socket, UploadData),
 									lftpc_prim:done(Socket),
-									lftpc_prim:setopts(Socket, [{active, once}]),
-									read_response(State, [{Code, Text}])
+									?setactive(Socket,
+										read_response(State, [{Code, Text}]),
+										{ok, {[{Code, Text}], undefined}})
 							end;
 						_ ->
-							lftpc_prim:setopts(Socket, [{active, once}]),
-							read_response(State, [{Code, Text}])
+							?setactive(Socket,
+								read_response(State, [{Code, Text}]),
+								{ok, {[{Code, Text}], undefined}})
 					end;
 				{_, true} ->
-					partial_upload(State, {Code, Text}, Data);
+					partial_upload(State, {Code, Text}, UploadData);
 				{true, _} ->
-					partial_download(State, {Code, Text})
-			end
+					partial_download(State, {Code, Text}, DownloadData)
+			end;
+		{ftp, Socket, {ReqRef, Data}} when is_binary(Data) ->
+			?setactive(Socket,
+				read_response_initial(State, UploadData, [Data | DownloadData]),
+				{ok, {[], lists:reverse([Data | DownloadData])}})
 	end.
 
 %% @private
-partial_download(State=#state{req_id=ReqId, stream_to=StreamTo, socket=Socket}, {Code, Text})
+partial_download(State=#state{req_id=ReqId, stream_to=StreamTo, socket=Socket}, {Code, Text}, DAcc)
 		when Code >= 100 andalso Code < 200 ->
 	StreamTo ! {response, ReqId, self(), {ok, {[{Code, Text}], self()}}},
-	lftpc_sock:setopts(Socket, [{active, once}]),
-	partial_download_loop(State, []);
-partial_download(_State=#state{req_ref=ReqRef, socket=Socket}, {Code, Text}) ->
-	lftpc_sock:setopts(Socket, [{active, once}]),
-	receive
-		{ftp, Socket, {ReqRef, done}} ->
-			{ok, {[{Code, Text}], undefined}}
-	end.
+	?setactive(Socket,
+		partial_download_loop(State, DAcc),
+		{ok, {[{Code, Text}], undefined}});
+partial_download(_State=#state{req_ref=ReqRef, socket=Socket}, {Code, Text}, _DAcc) ->
+	?setactive(Socket,
+		receive
+			{ftp, Socket, {ReqRef, done}} ->
+				{ok, {[{Code, Text}], undefined}}
+		end,
+		{ok, {[{Code, Text}], undefined}}).
 
 %% @private
 partial_download_loop(State=#state{parent=Parent, req_id=ReqId, req_ref=ReqRef, stream_to=StreamTo, socket=Socket}, CAcc) ->
 	receive
 		{ftp, Socket, {ReqRef, Data}} when is_binary(Data) ->
 			StreamTo ! {data_part, self(), Data},
-			lftpc_sock:setopts(Socket, [{active, once}]),
-			partial_download_loop(State, CAcc);
+			?setactive(Socket,
+				partial_download_loop(State, CAcc),
+				begin
+					StreamTo ! {ftp_eod, self(), lists:reverse(CAcc)},
+					{ok, {no_return, CAcc}}
+				end);
 		{ftp, Socket, {ReqRef, {Code, Text}}} ->
-			lftpc_sock:setopts(Socket, [{active, once}]),
-			partial_download_loop(State, [{Code, Text} | CAcc]);
+			?setactive(Socket,
+				partial_download_loop(State, [{Code, Text} | CAcc]),
+				begin
+					StreamTo ! {ftp_eod, self(), lists:reverse([{Code, Text} | CAcc])},
+					{ok, {no_return, CAcc}}
+				end);
 		{ftp, Socket, {ReqRef, done}} ->
 			lftpc_prim:controlling_process(Socket, Parent),
 			Parent ! {response, ReqId, self(), Socket},
@@ -204,17 +238,17 @@ partial_download_loop(State=#state{parent=Parent, req_id=ReqId, req_ref=ReqRef, 
 partial_upload(State=#state{req_id=ReqId, stream_to=StreamTo, socket=Socket}, {Code, Text}, Data)
 		when Code >= 100 andalso Code < 200 ->
 	StreamTo ! {response, ReqId, self(), {ok, {[{Code, Text}], self()}}},
-	lftpc_sock:setopts(Socket, [{active, once}]),
+	lftpc_prim:setopts(Socket, [{active, once}]),
 	ok = case Data of
 		undefined ->
 			ok;
 		_ ->
-			lftpc_sock:send(Socket, Data),
+			lftpc_prim:send(Socket, Data),
 			ok
 	end,
 	partial_upload_loop(State);
 partial_upload(_State=#state{req_ref=ReqRef, socket=Socket}, {Code, Text}, _Data) ->
-	lftpc_sock:setopts(Socket, [{active, once}]),
+	lftpc_prim:setopts(Socket, [{active, once}]),
 	receive
 		{ftp, Socket, {ReqRef, done}} ->
 			{ok, {[{Code, Text}], undefined}}
@@ -224,9 +258,9 @@ partial_upload(_State=#state{req_ref=ReqRef, socket=Socket}, {Code, Text}, _Data
 partial_upload_loop(State=#state{stream_to=StreamTo, socket=Socket}) ->
 	receive
 		{data_part, StreamTo, ftp_eod} ->
-			lftpc_sock:done(Socket),
+			lftpc_prim:done(Socket),
 			partial_download_loop(State, []);
 		{data_part, StreamTo, Data} ->
-			lftpc_sock:send(Socket, Data),
+			lftpc_prim:send(Socket, Data),
 			partial_upload_loop(State)
 	end.

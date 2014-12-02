@@ -84,23 +84,55 @@
 	sndbuf = undefined :: undefined | queue:queue(iodata())
 }).
 
+%% Types
 -type socket() :: pid().
 -export_type([socket/0]).
 
+%% Macros
 -define(PAUSE, 250).
+
+-define(CALL(Socket, Request, Error),
+	try
+		gen_server:call(Socket, Request, infinity)
+	catch
+		exit:{noproc, _} ->
+			Error
+	end).
+
+-define(CALL(Socket, Request), ?CALL(Socket, Request, {error, einval})).
 
 %%%===================================================================
 %%% API functions
 %%%===================================================================
 
-call(Pid, Command) ->
-	gen_server:call(Pid, {ctrl, [Command]}, infinity).
+-spec call(Socket, Command) -> {ok, CallRef} | {error, einval}
+	when
+		Socket  :: socket(),
+		Command :: binary(),
+		CallRef :: reference().
+call(Socket, Command) ->
+	?CALL(Socket, {ctrl, [Command]}).
 
-call(Pid, Command, Argument) ->
-	gen_server:call(Pid, {ctrl, [Command, Argument]}, infinity).
+-spec call(Socket, Command, Argument) -> {ok, CallRef} | {error, einval}
+	when
+		Socket   :: socket(),
+		Command  :: binary(),
+		Argument :: iodata(),
+		CallRef  :: reference().
+call(Socket, Command, Argument) ->
+	?CALL(Socket, {ctrl, [Command, Argument]}).
 
-close(Pid) ->
-	gen_server:call(Pid, close, infinity).
+-spec close(Socket) -> ok
+	when Socket :: socket().
+close(Socket) ->
+	ok = ?CALL(Socket, close, ok),
+	receive
+		{ftp_closed, Socket} ->
+			ok
+	after
+		0 ->
+			ok
+	end.
 
 connect(Host, Port, Options) ->
 	connect(Host, Port, Options, infinity).
@@ -108,26 +140,28 @@ connect(Host, Port, Options) ->
 connect(Host, Port, Options, Timeout) ->
 	start_link(self(), Host, Port, Options, Timeout).
 
-controlling_process(Pid, NewOwner) ->
-	case erlang:is_process_alive(Pid) of
+controlling_process(Socket, NewOwner) ->
+	case erlang:is_process_alive(Socket) of
 		false ->
 			{error, einval};
 		true ->
-			case getopts(Pid, [active, owner]) of
+			case getopts(Socket, [active, owner]) of
 				{ok, [_, {owner, NewOwner}]} ->
 					ok;
 				{ok, [_, {owner, Owner}]} when Owner =/= self() ->
 					{error, not_owner};
 				{ok, [{active, OldActive}, {owner, Owner}]} when Owner =:= self() ->
-					ok = setopts(Pid, [{active, false}]),
-					case sync_input(Pid, NewOwner, false) of
+					ok = setopts(Socket, [{active, false}]),
+					case sync_input(Socket, NewOwner, false) of
 						true ->
 							ok;
 						false ->
-							try setopts(Pid, [{active, OldActive}, {owner, NewOwner}]) of
+							try setopts(Socket, [{active, OldActive}, {owner, NewOwner}]) of
 								ok ->
-									erlang:unlink(Pid),
-									ok
+									erlang:unlink(Socket),
+									ok;
+								{error, Reason} ->
+									{error, Reason}
 							catch
 								error:Reason ->
 									{error, Reason}
@@ -138,34 +172,34 @@ controlling_process(Pid, NewOwner) ->
 			end
 	end.
 
-done(Pid) ->
-	gen_server:call(Pid, done, infinity).
+done(Socket) ->
+	?CALL(Socket, done).
 
-getopts(Pid, Options) ->
-	gen_server:call(Pid, {getopts, Options}, infinity).
+getopts(Socket, Options) ->
+	?CALL(Socket, {getopts, Options}).
 
-peername(Pid) ->
-	gen_server:call(Pid, peername, infinity).
+peername(Socket) ->
+	?CALL(Socket, peername).
 
-send(Pid, Packet) ->
-	gen_server:call(Pid, {send, Packet}, infinity).
+send(Socket, Packet) ->
+	?CALL(Socket, {send, Packet}).
 
-sendfile(Pid, Filename) ->
-	sendfile(Pid, Filename, 0, 0, []).
+sendfile(Socket, Filename) ->
+	sendfile(Socket, Filename, 0, 0, []).
 
-sendfile(Pid, Filename, Offset, Bytes) ->
-	sendfile(Pid, Filename, Offset, Bytes, []).
+sendfile(Socket, Filename, Offset, Bytes) ->
+	sendfile(Socket, Filename, Offset, Bytes, []).
 
-sendfile(Pid, Filename, Offset, Bytes, Opts)
+sendfile(Socket, Filename, Offset, Bytes, Opts)
 		when is_list(Filename) orelse is_atom(Filename)
 		orelse is_binary(Filename) ->
-	gen_server:call(Pid, {sendfile, Filename, Offset, Bytes, Opts}, infinity).
+	?CALL(Socket, {sendfile, Filename, Offset, Bytes, Opts}).
 
-setopts(Pid, Options) ->
-	gen_server:call(Pid, {setopts, Options}, infinity).
+setopts(Socket, Options) ->
+	?CALL(Socket, {setopts, Options}).
 
-sockname(Pid) ->
-	gen_server:call(Pid, sockname, infinity).
+sockname(Socket) ->
+	?CALL(Socket, sockname).
 
 %%%===================================================================
 %%% Internal API functions
@@ -324,6 +358,13 @@ handle(SD0, SN, {To, Tag}, close) ->
 	terminate(SD2, SN, normal).
 
 %% @private
+shutdown(SD0, SN, Reason) ->
+	SD1 = SD0#state_data{active=false},
+	SD2 = data_clean(SD1),
+	SD3 = ctrl_close(SD2),
+	terminate(SD3, SN, Reason).
+
+%% @private
 terminate(_SD, _SN, Reason) ->
 	exit(Reason).
 
@@ -360,6 +401,8 @@ connecting(SD0=#state_data{owner=Owner, ctrl=Ctrl}) ->
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, not_owner}},
 			connecting(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, connecting, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {connecting, SD0});
 		Info ->
@@ -386,6 +429,8 @@ ready_wait(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocke
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, not_owner}},
 			ready_wait(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, ready_wait, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {ready_wait, SD0});
 		Info ->
@@ -412,12 +457,14 @@ idle(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=CSoc
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, not_owner}},
 			idle(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, idle, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {idle, SD0});
 		Info ->
 			error_logger:error_msg(
-				"FTP client ~p received unexpected message ~p in state ~p~n",
-				[self(), Info, idle])
+				"FTP client ~p received unexpected message ~p in state ~p ~p~n",
+				[self(), Info, idle, SD0])
 	end.
 
 %% @private
@@ -466,6 +513,8 @@ idle_opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csoc
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, not_owner}},
 			idle_opening(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, idle_opening, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {idle_opening, SD0});
 		Info ->
@@ -502,6 +551,8 @@ idle_transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, cso
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, not_owner}},
 			idle_transfer(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, idle_transfer, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {idle_transfer, SD0});
 		Info ->
@@ -532,6 +583,8 @@ reply_wait(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocke
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, not_owner}},
 			reply_wait(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, reply_wait, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {reply_wait, SD0});
 		Info ->
@@ -595,6 +648,8 @@ reply_wait_opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, not_owner}},
 			reply_wait_opening(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, reply_wait_opening, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {reply_wait_opening, SD0});
 		Info ->
@@ -631,6 +686,8 @@ reply_wait_transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError
 		{'$gen_call', {To, Tag}, _} ->
 			To ! {Tag, {error, not_owner}},
 			reply_wait_transfer(SD0);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, reply_wait_transfer, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {reply_wait_transfer, SD0});
 		Info ->
@@ -700,6 +757,8 @@ opening(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=C
 			SD2 = data_inactive(SD1),
 			SD3 = ctrl_done(SD2),
 			before_loop(SD3, idle_opening);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, opening, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {opening, SD0});
 		Info ->
@@ -742,6 +801,8 @@ transfer(SD0=#state_data{owner=Owner, cmessages={COK, CClosed, CError}, csocket=
 			SD2 = data_inactive(SD1),
 			SD3 = ctrl_done(SD2),
 			before_loop(SD3, idle_transfer);
+		{'EXIT', Owner, _Reason} ->
+			shutdown(SD0, transfer, normal);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Owner, ?MODULE, [], {transfer, SD0});
 		Info ->
