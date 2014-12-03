@@ -219,8 +219,15 @@ append(Socket, Pathname, Data, Timeout, Options) ->
 	case start_data(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_appe(Socket, Pathname, Data, Timeout, Options) of
+				{ok, AppeResponse={_, Pid}} when is_pid(Pid) ->
+					case is_pre_response(AppeResponse) of
+						true ->
+							{ok, AppeResponse};
+						false ->
+							{error, AppeResponse}
+					end;
 				{ok, AppeResponse} ->
-					case is_pre_pos_response(AppeResponse) of
+					case is_pos_response(AppeResponse) of
 						true ->
 							{ok, AppeResponse};
 						false ->
@@ -462,6 +469,13 @@ ls(Socket, Timeout, Options) ->
 	case start_data(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_list(Socket, Timeout, Options) of
+				{ok, ListResponse={_, Pid}} when is_pid(Pid) ->
+					case is_pre_response(ListResponse) of
+						true ->
+							{ok, ListResponse};
+						false ->
+							{error, ListResponse}
+					end;
 				{ok, ListResponse} ->
 					case is_pos_response(ListResponse) of
 						true ->
@@ -480,6 +494,13 @@ ls(Socket, Pathname, Timeout, Options) ->
 	case start_data(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_list(Socket, Pathname, Timeout, Options) of
+				{ok, ListResponse={_, Pid}} when is_pid(Pid) ->
+					case is_pre_response(ListResponse) of
+						true ->
+							{ok, ListResponse};
+						false ->
+							{error, ListResponse}
+					end;
 				{ok, ListResponse} ->
 					case is_pos_response(ListResponse) of
 						true ->
@@ -512,6 +533,13 @@ nlist(Socket, Timeout, Options) ->
 	case start_data(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_nlst(Socket, Timeout, Options) of
+				{ok, NlstResponse={_, Pid}} when is_pid(Pid) ->
+					case is_pre_response(NlstResponse) of
+						true ->
+							{ok, NlstResponse};
+						false ->
+							{error, NlstResponse}
+					end;
 				{ok, NlstResponse} ->
 					case is_pos_response(NlstResponse) of
 						true ->
@@ -530,6 +558,13 @@ nlist(Socket, Pathname, Timeout, Options) ->
 	case start_data(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_nlst(Socket, Pathname, Timeout, Options) of
+				{ok, NlstResponse={_, Pid}} when is_pid(Pid) ->
+					case is_pre_response(NlstResponse) of
+						true ->
+							{ok, NlstResponse};
+						false ->
+							{error, NlstResponse}
+					end;
 				{ok, NlstResponse} ->
 					case is_pos_response(NlstResponse) of
 						true ->
@@ -591,8 +626,15 @@ restart(Socket, Pathname, Offset, Timeout, Options) ->
 					case is_pos_response(RestResponse) of
 						true ->
 							case ftp_retr(Socket, Pathname, Timeout, Options) of
+								{ok, RetrResponse={_, Pid}} when is_pid(Pid) ->
+									case is_pre_response(RetrResponse) of
+										true ->
+											{ok, RetrResponse};
+										false ->
+											{error, RetrResponse}
+									end;
 								{ok, RetrResponse} ->
-									case is_pre_pos_response(RetrResponse) of
+									case is_pos_response(RetrResponse) of
 										true ->
 											{ok, RetrResponse};
 										false ->
@@ -615,8 +657,15 @@ retrieve(Socket, Pathname, Timeout, Options) ->
 	case start_data(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_retr(Socket, Pathname, Timeout, Options) of
+				{ok, RetrResponse={_, Pid}} when is_pid(Pid) ->
+					case is_pre_response(RetrResponse) of
+						true ->
+							{ok, RetrResponse};
+						false ->
+							{error, RetrResponse}
+					end;
 				{ok, RetrResponse} ->
-					case is_pre_pos_response(RetrResponse) of
+					case is_pos_response(RetrResponse) of
 						true ->
 							{ok, RetrResponse};
 						false ->
@@ -665,8 +714,15 @@ store(Socket, Pathname, Data, Timeout, Options) ->
 	case start_data(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_stor(Socket, Pathname, Data, Timeout, Options) of
+				{ok, StorResponse={_, Pid}} when is_pid(Pid) ->
+					case is_pre_response(StorResponse) of
+						true ->
+							{ok, StorResponse};
+						false ->
+							{error, StorResponse}
+					end;
 				{ok, StorResponse} ->
-					case is_pre_pos_response(StorResponse) of
+					case is_pos_response(StorResponse) of
 						true ->
 							{ok, StorResponse};
 						false ->
