@@ -153,7 +153,8 @@ loop(SD=#state_data{parent=Parent, stream_to=StreamTo, req_ref=ReqRef, socket=So
 		{'EXIT', _, Reason} ->
 			shutdown(SD, SN, Reason);
 		{empty, Empty} when is_reference(Empty) ->
-			before_loop(SD, SN);
+			lftpc_prim:setopts(Socket, [{active, once}]),
+			loop(SD#state_data{empty=undefined}, SN);
 		{'DOWN', _, process, Parent, _} ->
 			shutdown(SD, SN, normal);
 		{'DOWN', _, process, StreamTo, _} ->
@@ -170,10 +171,8 @@ before_loop(SD0=#state_data{empty=undefined}, SN) ->
 	SD1 = SD0#state_data{empty=Empty},
 	erlang:send_after(0, self(), {empty, Empty}),
 	loop(SD1, SN);
-before_loop(SD0=#state_data{socket=Socket}, SN) ->
-	lftpc_prim:setopts(Socket, [{active, once}]),
-	SD1 = SD0#state_data{empty=undefined},
-	loop(SD1, SN).
+before_loop(SD, SN) ->
+	loop(SD, SN).
 
 %% @private
 enqueue(SD0=#state_data{rcvbuf=Rcvbuf, socket=Socket}, SN, M) ->
