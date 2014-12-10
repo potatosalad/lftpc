@@ -35,7 +35,10 @@ start_link() ->
 
 %% @private
 init([]) ->
-	ChildSpecs = [],
+	lftpc_server = ets:new(lftpc_server, [named_table, public, set]),
+	ChildSpecs = [
+		?CHILD(lftpc_server, worker)
+	],
 	Restart = {one_for_one, 10, 10},
 	{ok, {Restart, ChildSpecs}}.
 

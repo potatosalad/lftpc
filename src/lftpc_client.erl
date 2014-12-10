@@ -13,26 +13,21 @@
 -include("lftpc_types.hrl").
 
 %% API exports
--export([start_request/3]).
-
-%% Internal API exports
--export([init_it/4]).
+-export([request/7]).
 
 %% Records
 -record(state_data, {
-	parent    = undefined :: undefined | pid(),
-	owner     = undefined :: undefined | pid(),
-	stream_to = undefined :: undefined | pid(),
 	req_id    = undefined :: undefined | term(),
-	req_ref   = undefined :: undefined | reference(),
+	stream_to = undefined :: undefined | pid(),
 	socket    = undefined :: undefined | lftpc_prim:socket(),
-	% Buffers
-	ctrl_buf = [] :: [{integer(), iodata()}],
-	data_buf = [] :: iodata(),
-	empty    = undefined :: undefined | reference(),
-	rcvbuf   = undefined :: undefined | queue:queue(term()),
+	req_ref   = undefined :: undefined | reference(),
+	replies   = [] :: [{integer(), iodata()}],
+	% Decoders
+	ctrl_decoder = undefined :: undefined | {function(), any()},
+	data_decoder = undefined :: undefined | {function(), any()},
 	% Download
 	partial_download = undefined :: undefined | boolean(),
+	download_data    = []        :: iodata(),
 	download_part    = undefined :: undefined | non_neg_integer() | infinity,
 	download_window  = undefined :: undefined | non_neg_integer() | infinity,
 	% Upload
@@ -45,34 +40,9 @@
 %% API functions
 %%====================================================================
 
-start_request(ReqId, Socket, Owner) ->
-	proc_lib:start_link(?MODULE, init_it, [self(), ReqId, Socket, Owner]).
-
-%%====================================================================
-%% Internal API functions
-%%====================================================================
-
-%% @private
-init_it(Parent, ReqId, Socket, Owner) ->
-	ok = proc_lib:init_ack(Parent, {ok, self()}),
-	receive
-		{request, ReqId, StreamTo, Owner, Command, Argument, UploadData, Options} ->
-			process_flag(trap_exit, true),
-			request(Parent, Owner, StreamTo, ReqId, Socket, Command, Argument, UploadData, Options)
-	end.
-
-%%%-------------------------------------------------------------------
-%%% Request functions
-%%%-------------------------------------------------------------------
-
-%% @private
-request(Parent, Owner, StreamTo, ReqId, Socket, Command, Argument, Data, Options) ->
-	unlink(Parent),
-	unlink(StreamTo),
-	ParentMonitor = erlang:monitor(process, Parent),
-	StreamToMonitor = erlang:monitor(process, StreamTo),
+request(ReqId, StreamTo, Socket, Command, Argument, Data, Options) ->
 	Result = try
-		execute(Parent, Owner, StreamTo, ReqId, Socket, Command, Argument, Data, Options)
+		execute(ReqId, StreamTo, Socket, Command, Argument, Data, Options)
 	catch
 		Reason ->
 			{response, ReqId, self(), {error, Reason}};
@@ -85,16 +55,19 @@ request(Parent, Owner, StreamTo, ReqId, Socket, Command, Argument, Data, Options
 		{response, _, _, {ok, no_return}} ->
 			ok;
 		_ ->
-			lftpc_prim:controlling_process(Socket, Parent),
-			Parent ! {response, ReqId, self(), Socket},
 			StreamTo ! Result
 	end,
-	true = erlang:demonitor(ParentMonitor, [flush]),
-	true = erlang:demonitor(StreamToMonitor, [flush]),
+	unlink(StreamTo),
 	ok.
 
+%%%-------------------------------------------------------------------
+%%% Request functions
+%%%-------------------------------------------------------------------
+
 %% @private
-execute(Parent, Owner, StreamTo, ReqId, Socket, Command, Argument, UploadData, Options) ->
+execute(ReqId, StreamTo, Socket, Command, Argument, Data, Options) ->
+	CtrlDecoder = proplists:get_value(ctrl_decoder, Options),
+	DataDecoder = proplists:get_value(data_decoder, Options),
 	UploadWindowSize = proplists:get_value(partial_upload, Options),
 	PartialUpload = proplists:is_defined(partial_upload, Options),
 	PartialDownload = proplists:is_defined(partial_download, Options),
@@ -102,251 +75,226 @@ execute(Parent, Owner, StreamTo, ReqId, Socket, Command, Argument, UploadData, O
 	DownloadWindowSize = proplists:get_value(window_size, PartialDownloadOptions, infinity),
 	DownloadPartSize = proplists:get_value(part_size, PartialDownloadOptions, infinity),
 	StateData = #state_data{
-		parent    = Parent,
-		owner     = Owner,
-		stream_to = StreamTo,
 		req_id    = ReqId,
+		stream_to = StreamTo,
 		socket    = Socket,
-		% Buffers
-		rcvbuf = queue:new(),
+		% Decoders
+		ctrl_decoder = CtrlDecoder,
+		data_decoder = DataDecoder,
 		% Download
 		partial_download = PartialDownload,
 		download_part    = DownloadPartSize,
 		download_window  = DownloadWindowSize,
 		% Upload
 		partial_upload = PartialUpload,
-		upload_data    = UploadData,
+		upload_data    = Data,
 		upload_window  = UploadWindowSize
 	},
+	Monitor = erlang:monitor(process, StreamTo),
 	Response = send_request(StateData, Command, Argument),
+	erlang:demonitor(Monitor, [flush]),
 	{response, ReqId, self(), Response}.
 
 %% @private
+send_request(SD0=#state_data{socket=Socket}, Command, undefined) ->
+	{ok, ReqRef} = lftpc_sock:quote(Socket, Command),
+	SD1 = SD0#state_data{req_ref=ReqRef},
+	loop(SD1, read_initial);
 send_request(SD0=#state_data{socket=Socket}, Command, Argument) ->
-	case do_call(Socket, Command, Argument) of
-		{ok, ReqRef} ->
-			SD1 = SD0#state_data{req_ref=ReqRef},
-			before_loop(SD1, read_initial)
-	end.
+	{ok, ReqRef} = lftpc_sock:quote(Socket, Command, Argument),
+	SD1 = SD0#state_data{req_ref=ReqRef},
+	loop(SD1, read_initial).
 
 %%%-------------------------------------------------------------------
 %%% Loop functions
 %%%-------------------------------------------------------------------
 
 %% @private
-loop(SD=#state_data{parent=Parent, stream_to=StreamTo, req_ref=ReqRef, socket=Socket, empty=Empty}, SN) ->
+loop(SD0=#state_data{stream_to=StreamTo, socket=Socket, req_ref=ReqRef}, SN) ->
 	receive
-		{ftp, Socket, {ReqRef, {Code, Text}}} ->
-			handle_ctrl(SD, SN, {Code, Text});
-		{ftp, Socket, {ReqRef, Data}} when is_binary(Data) ->
-			handle_data(SD, SN, Data);
-		{ftp, Socket, {ReqRef, done}} ->
-			handle_done(SD, SN);
+		{ftp, Socket, ReqRef, {Code, Text}} ->
+			{true, Reply, SD1} = ctrl_decode(SD0, {Code, Text}),
+			handle_ctrl(SD1, SN, Reply);
+		{data_part, Socket, ReqRef, Data} ->
+			case data_decode(SD0, Data) of
+				{true, NewData, SD1} ->
+					handle_download(SD1, SN, NewData);
+				{false, SD1} ->
+					loop(SD1, SN)
+			end;
 		{data_part, StreamTo, Data} ->
-			handle_send(SD, SN, Data);
-		M={ftp, Socket, _Message} ->
-			enqueue(SD, SN, M);
-		M={ftp_error, Socket, _Reason} ->
-			enqueue(SD, SN, M);
-		M={ftp_closed, Socket} ->
-			enqueue(SD, SN, M);
-		{'EXIT', _, Reason} ->
-			shutdown(SD, SN, Reason);
-		{empty, Empty} when is_reference(Empty) ->
-			lftpc_prim:setopts(Socket, [{active, once}]),
-			loop(SD#state_data{empty=undefined}, SN);
-		{'DOWN', _, process, Parent, _} ->
-			shutdown(SD, SN, normal);
+			handle_upload(SD0, SN, Data);
+		{ftp_eod, Socket, ReqRef, {Code, Text}} ->
+			{true, Reply, SD1} = ctrl_decode(SD0, {Code, Text}),
+			handle_eod(SD1, SN, Reply);
+		{ftp_error, Socket, ReqRef, Reason} ->
+			handle_error(SD0, SN, {ftp_error, Reason});
+		{data_error, Socket, ReqRef, Reason} ->
+			handle_error(SD0, SN, {data_error, Reason});
+		{ftp_closed, Socket, ReqRef} ->
+			handle_closed(SD0, SN);
 		{'DOWN', _, process, StreamTo, _} ->
-			shutdown(SD, SN, normal);
+			exit(normal);
 		Info ->
 			error_logger:error_msg(
 				"~p ~p received unexpected message ~p in state ~p~nStateData: ~p~n",
-				[?MODULE, self(), Info, SN, SD])
+				[?MODULE, self(), Info, SN, SD0])
 	end.
 
 %% @private
-before_loop(SD0=#state_data{empty=undefined}, SN) ->
-	Empty = make_ref(),
-	SD1 = SD0#state_data{empty=Empty},
-	erlang:send_after(0, self(), {empty, Empty}),
-	loop(SD1, SN);
-before_loop(SD, SN) ->
-	loop(SD, SN).
-
-%% @private
-enqueue(SD0=#state_data{rcvbuf=Rcvbuf, socket=Socket}, SN, M) ->
-	SD1 = SD0#state_data{rcvbuf=queue:in(M, Rcvbuf)},
-	case M of
-		{ftp, Socket, _Message} ->
-			loop(SD1, SN);
-		{ftp_error, Socket, Reason} ->
-			shutdown(SD1, SN, Reason);
-		{ftp_closed, Socket} ->
-			shutdown(SD1, SN, closed)
-	end.
-
-%% @private
-handle_ctrl(SD0=#state_data{partial_download=false,
-		partial_upload=false, upload_data=undefined,
-		ctrl_buf=CtrlBuf}, read_initial, {Code, Text})
-			when Code >= 100 andalso Code < 200 ->
-	SD1 = SD0#state_data{ctrl_buf=[{Code, Text} | CtrlBuf]},
-	before_loop(SD1, read_data);
-handle_ctrl(SD0=#state_data{socket=Socket, partial_download=false,
-		partial_upload=false, upload_data=UploadData,
-		ctrl_buf=CtrlBuf}, read_initial, {Code, Text})
-			when Code >= 100 andalso Code < 200 ->
-	lftpc_prim:send(Socket, UploadData),
-	lftpc_prim:done(Socket),
-	SD1 = SD0#state_data{ctrl_buf=[{Code, Text} | CtrlBuf]},
-	SD2 = SD1#state_data{upload_data=undefined},
-	before_loop(SD2, read_ctrl);
-handle_ctrl(SD=#state_data{partial_upload=true}, read_initial,
-		{Code, Text}) ->
-	partial_upload(SD, {Code, Text});
-handle_ctrl(SD=#state_data{partial_download=true}, read_initial,
-		{Code, Text}) ->
-	partial_download(SD, {Code, Text});
-handle_ctrl(SD0=#state_data{ctrl_buf=CtrlBuf}, read_initial,
-		{Code, Text}) ->
-	SD1 = SD0#state_data{ctrl_buf=[{Code, Text} | CtrlBuf]},
-	before_loop(SD1, read_ctrl);
-handle_ctrl(SD0=#state_data{ctrl_buf=CtrlBuf}, SN, {Code, Text})
-		when SN =:= partial_download
-		orelse SN =:= read_ctrl
-		orelse SN =:= read_data ->
-	SD1 = SD0#state_data{ctrl_buf=[{Code, Text} | CtrlBuf]},
-	before_loop(SD1, SN).
-
-%% @private
-handle_data(SD=#state_data{stream_to=StreamTo}, SN=partial_download, Data) ->
-	StreamTo ! {data_part, self(), Data},
-	before_loop(SD, SN);
-handle_data(SD0=#state_data{data_buf=DataBuf}, SN, Data)
-		when SN =:= read_initial
-		orelse SN =:= read_data ->
-	SD1 = SD0#state_data{data_buf=[Data | DataBuf]},
-	before_loop(SD1, SN).
-
-%% @private
-handle_done(SD0=#state_data{parent=Parent, stream_to=StreamTo,
-		req_id=ReqId, socket=Socket, ctrl_buf=CtrlBuf},
-		partial_download) ->
-	_SD1 = flush_rcvbuf(SD0),
-	lftpc_prim:controlling_process(Socket, Parent),
-	Parent ! {response, ReqId, self(), Socket},
-	StreamTo ! {ftp_eod, self(), lists:reverse(CtrlBuf)},
-	{ok, no_return};
-handle_done(SD0=#state_data{ctrl_buf=CtrlBuf, data_buf=DataBuf}, SN)
-		when SN =:= read_ctrl
-		orelse SN =:= read_data ->
-	_SD1 = flush_rcvbuf(SD0),
-	Ctrl = lists:reverse(CtrlBuf),
-	Data = case DataBuf of
-		[] ->
-			undefined;
-		_ ->
-			lists:reverse(DataBuf)
-	end,
-	{ok, {Ctrl, Data}}.
-
-%% @private
-handle_send(SD=#state_data{socket=Socket}, partial_upload, ftp_eod) ->
-	lftpc_prim:done(Socket),
-	before_loop(SD, partial_download);
-handle_send(SD=#state_data{stream_to=StreamTo, socket=Socket},
-		SN=partial_upload, UploadData) ->
-	lftpc_prim:send(Socket, UploadData),
-	StreamTo ! {ack, self()},
-	before_loop(SD, SN).
-
-%% @private
-shutdown(SD=#state_data{stream_to=StreamTo, req_id=ReqId,
-		socket=Socket, parent=Parent}, SN, Reason) ->
-	% error_logger:error_msg(
-	% 	"~p ~p shutting down for reason ~p in state ~p~nStateData: ~p~n",
-	% 	[?MODULE, self(), Reason, SN, SD]),
-	ok = case Reason of
-		timeout ->
-			ok;
-		_ ->
-			StreamTo ! {response, ReqId, self(), {error, Reason}},
-			ok
-	end,
-	_ = SN,
-	_ = flush_rcvbuf(SD),
-	lftpc_prim:controlling_process(Socket, Parent),
-	exit(Reason).
-
-%%%-------------------------------------------------------------------
-%%% Download functions
-%%%-------------------------------------------------------------------
+maybe_send_data(SD=#state_data{partial_download=false,
+		partial_upload=false, upload_data=undefined}) ->
+	loop(SD, read_data);
+maybe_send_data(SD0=#state_data{socket=Socket, partial_download=false,
+		partial_upload=false, upload_data=Data}) ->
+	lftpc_sock:send_data_part(Socket, Data),
+	lftpc_sock:send_data_part(Socket, ftp_eod),
+	SD1 = SD0#state_data{upload_data=undefined},
+	loop(SD1, read_ctrl);
+maybe_send_data(SD=#state_data{partial_upload=true}) ->
+	partial_upload(SD);
+maybe_send_data(SD=#state_data{partial_download=true}) ->
+	partial_download(SD).
 
 %% @private
 partial_download(SD0=#state_data{req_id=ReqId, stream_to=StreamTo,
-		ctrl_buf=CtrlBuf, data_buf=DataBuf}, {Code, Text})
-			when Code >= 100 andalso Code < 200 ->
-	Ctrl = lists:reverse([{Code, Text} | CtrlBuf]),
+		replies=[R], download_data=Data}) ->
 	Download = self(),
-	Response = {ok, {Ctrl, Download}},
+	Response = {ok, {R, Download}},
 	StreamTo ! {response, ReqId, self(), Response},
-	SD1 = case DataBuf of
+	SD1 = case Data of
 		[] ->
 			SD0;
 		_ ->
-			StreamTo ! {data_part, self(), iolist_to_binary(lists:reverse(DataBuf))},
-			SD0#state_data{data_buf=[]}
+			StreamTo ! {data_part, self(), lists:reverse(Data)},
+			SD0#state_data{download_data=[]}
 	end,
-	SD2 = SD1#state_data{ctrl_buf=[]},
-	before_loop(SD2, partial_download);
-partial_download(SD0=#state_data{ctrl_buf=CtrlBuf}, {Code, Text}) ->
-	SD1 = SD0#state_data{ctrl_buf=[{Code, Text} | CtrlBuf]},
-	before_loop(SD1, read_ctrl).
-
-%%%-------------------------------------------------------------------
-%%% Upload functions
-%%%-------------------------------------------------------------------
+	SD2 = SD1#state_data{replies=[]},
+	loop(SD2, partial_download).
 
 %% @private
 partial_upload(SD0=#state_data{req_id=ReqId, stream_to=StreamTo,
-		socket=Socket, ctrl_buf=CtrlBuf,
-		upload_window=UploadWindowSize}, {Code, Text})
-			when Code >= 100 andalso Code < 200 ->
-	Ctrl = lists:reverse([{Code, Text} | CtrlBuf]),
+		socket=Socket, replies=[R], upload_data=Data,
+		upload_window=UploadWindowSize}) ->
 	Upload = {self(), UploadWindowSize},
-	Response = {ok, {Ctrl, Upload}},
+	Response = {ok, {R, Upload}},
 	StreamTo ! {response, ReqId, self(), Response},
-	SD1 = case SD0#state_data.upload_data of
+	SD1 = case Data of
 		undefined ->
 			SD0;
-		UploadData ->
-			lftpc_prim:send(Socket, UploadData),
+		_ ->
+			lftpc_sock:send_data_part(Socket, Data),
 			SD0#state_data{upload_data=undefined}
 	end,
-	SD2 = SD1#state_data{ctrl_buf=[]},
-	before_loop(SD2, partial_upload);
-partial_upload(SD0=#state_data{ctrl_buf=CtrlBuf}, {Code, Text}) ->
-	SD1 = SD0#state_data{ctrl_buf=[{Code, Text} | CtrlBuf]},
-	before_loop(SD1, read_ctrl).
+	SD2 = SD1#state_data{replies=[]},
+	loop(SD2, partial_upload).
+
+%%%-------------------------------------------------------------------
+%%% Handle functions
+%%%-------------------------------------------------------------------
+
+%% @private
+handle_ctrl(SD0=#state_data{replies=R}, read_initial, {Code, Text})
+		when Code =:= 125
+		orelse Code =:= 150 ->
+	SD1 = SD0#state_data{replies=[{Code, Text} | R]},
+	maybe_send_data(SD1);
+handle_ctrl(SD0=#state_data{replies=R}, read_initial, {Code, Text}) ->
+	SD1 = SD0#state_data{replies=[{Code, Text} | R]},
+	loop(SD1, read_ctrl);
+handle_ctrl(SD0=#state_data{replies=R}, SN, {Code, Text}) ->
+	SD1 = SD0#state_data{replies=[{Code, Text} | R]},
+	loop(SD1, SN).
+
+%% @private
+handle_download(SD=#state_data{stream_to=StreamTo}, SN=partial_download, Data) ->
+	StreamTo ! {data_part, self(), Data},
+	loop(SD, SN);
+handle_download(SD0=#state_data{download_data=D}, SN, Data)
+		when SN =:= read_initial
+		orelse SN =:= read_data ->
+	SD1 = SD0#state_data{download_data=[Data | D]},
+	loop(SD1, SN).
+
+%% @private
+handle_upload(SD=#state_data{socket=Socket}, partial_upload, ftp_eod) ->
+	lftpc_sock:send_data_part(Socket, ftp_eod),
+	loop(SD, partial_download);
+handle_upload(SD=#state_data{stream_to=StreamTo, socket=Socket},
+		SN=partial_upload, Data) ->
+	lftpc_sock:send_data_part(Socket, Data),
+	StreamTo ! {ack, self()},
+	loop(SD, SN).
+
+%% @private
+handle_eod(SD=#state_data{replies=Replies}, SN, Reply) ->
+	handle_eod(SD, SN, Replies, Reply).
+
+%% @private
+handle_eod(_SD, read_initial, [], {Code, Text}) ->
+	{ok, {undefined, {Code, Text}, undefined}};
+handle_eod(_SD, read_ctrl, [R], {Code, Text}) ->
+	{ok, {R, {Code, Text}, undefined}};
+handle_eod(_SD, read_ctrl, [], {Code, Text}) ->
+	{ok, {undefined, {Code, Text}, undefined}};
+handle_eod(_SD=#state_data{download_data=D}, read_data, [R], {Code, Text}) ->
+	{ok, {R, {Code, Text}, lists:reverse(D)}};
+handle_eod(_SD=#state_data{stream_to=StreamTo}, partial_download, [], {Code, Text}) ->
+	StreamTo ! {ftp_eod, self(), {Code, Text}},
+	{ok, no_return};
+handle_eod(_SD=#state_data{stream_to=StreamTo}, partial_upload, [], {Code, Text}) ->
+	StreamTo ! {ftp_eod, self(), {Code, Text}},
+	{ok, no_return}.
+
+%% @private
+handle_error(_SD, SN, Reason)
+		when SN =:= read_initial
+		orelse SN =:= read_ctrl
+		orelse SN =:= read_data ->
+	{error, Reason};
+handle_error(#state_data{stream_to=StreamTo}, SN, Reason)
+		when SN =:= partial_upload
+		orelse SN =:= partial_download ->
+	StreamTo ! {ftp_error, self(), Reason},
+	{ok, no_return}.
+
+%% @private
+handle_closed(_SD, SN)
+		when SN =:= read_initial
+		orelse SN =:= read_ctrl
+		orelse SN =:= read_data ->
+	{error, closed};
+handle_closed(#state_data{stream_to=StreamTo}, SN)
+		when SN =:= partial_upload
+		orelse SN =:= partial_download ->
+	StreamTo ! {ftp_closed, self()},
+	{ok, no_return}.
+
+%%%-------------------------------------------------------------------
+%%% Decoder functions
+%%%-------------------------------------------------------------------
+
+%% @private
+ctrl_decode(SD=#state_data{ctrl_decoder=undefined}, Reply) ->
+	{true, Reply, SD};
+ctrl_decode(SD0=#state_data{ctrl_decoder={Function, State}}, Reply) ->
+	{true, NewReply, NewState} = Function(State, Reply),
+	SD1 = SD0#state_data{ctrl_decoder={Function, NewState}},
+	{true, NewReply, SD1}.
+
+%% @private
+data_decode(SD=#state_data{data_decoder=undefined}, Data) ->
+	{true, Data, SD};
+data_decode(SD0=#state_data{data_decoder={Function, State}}, Data) ->
+	case Function(State, Data) of
+		{true, NewData, NewState} ->
+			SD1 = SD0#state_data{data_decoder={Function, NewState}},
+			{true, NewData, SD1};
+		{false, NewState} ->
+			SD1 = SD0#state_data{data_decoder={Function, NewState}},
+			{false, SD1}
+	end.
 
 %%%-------------------------------------------------------------------
 %%% Internal functions
 %%%-------------------------------------------------------------------
-
-%% @private
-do_call(Socket, Command, undefined) ->
-	lftpc_prim:call(Socket, Command);
-do_call(Socket, Command, Argument) ->
-	lftpc_prim:call(Socket, Command, Argument).
-
-%% @private
-flush_rcvbuf(SD0=#state_data{parent=Parent, rcvbuf=Rcvbuf}) ->
-	case queue:out(Rcvbuf) of
-		{{value, Message}, NewRcvbuf} ->
-			Parent ! Message,
-			SD1 = SD0#state_data{rcvbuf=NewRcvbuf},
-			flush_rcvbuf(SD1);
-		{empty, Rcvbuf} ->
-			SD0
-	end.

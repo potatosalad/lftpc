@@ -13,8 +13,10 @@
 %% API exports
 -export([new_decoder/0]).
 -export([decode/2]).
+-export([parse_auth/1]).
 -export([parse_epsv/1]).
 -export([parse_pasv/1]).
+-export([parse_prot/1]).
 
 -record(decoder, {
 	mode = idle      :: idle | more,
@@ -76,6 +78,9 @@ decode(Binary, Decoder=#decoder{mode=more, text=Text}) ->
 decode(Binary = <<>>, Decoder=#decoder{}) ->
 	{false, Binary, Decoder}.
 
+parse_auth(Data) ->
+	parse_auth_mech(Data, <<>>).
+
 parse_epsv(<< $(, $|, $|, $|, Rest/binary >>) ->
 	parse_epsv_port(Rest, 0, 0);
 parse_epsv(<< _, Rest/binary >>) ->
@@ -88,6 +93,15 @@ parse_pasv(Rest = << C, _/binary >>) when C >= $0 andalso C < $9 ->
 parse_pasv(<< _, Rest/binary >>) ->
 	parse_pasv(Rest);
 parse_pasv(<<>>) ->
+	false.
+
+parse_prot(<< $C, Rest/binary >>) ->
+	{true, clear, Rest};
+parse_prot(<< $P, Rest/binary >>) ->
+	{true, private, Rest};
+parse_prot(<< _, Rest/binary >>) ->
+	parse_prot(Rest);
+parse_prot(<<>>) ->
 	false.
 
 %%%-------------------------------------------------------------------
@@ -103,6 +117,20 @@ decode_line(<< C, Rest/binary >>, Line) ->
 	decode_line(Rest, << Line/binary, C >>);
 decode_line(<<>>, _Line) ->
 	false.
+
+%%%-------------------------------------------------------------------
+%%% AUTH
+%%%-------------------------------------------------------------------
+
+parse_auth_mech(<< C, Rest/binary >>, Mech)
+		when C >= $A andalso C =< $Z ->
+	parse_auth_mech(Rest, << Mech/binary, C >>);
+parse_auth_mech(<< _, Rest/binary >>, Mech = <<>>) ->
+	parse_auth_mech(Rest, Mech);
+parse_auth_mech(<<>>, _Mech) ->
+	false;
+parse_auth_mech(Rest, Mech) ->
+	{true, Mech, Rest}.
 
 %%%-------------------------------------------------------------------
 %%% EPSV

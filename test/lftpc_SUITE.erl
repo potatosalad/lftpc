@@ -89,7 +89,7 @@ ftp_implicit(Config) ->
 
 %% @private
 ftp_smoke(Host, Port, Credentials, Options) ->
-	{ok, {_, Socket}} = lftpc:connect(Host, Port, Options),
+	{ok, {_, _, Socket}} = lftpc:connect(Host, Port, Options),
 	{ok, _} = case Credentials of
 		anonymous ->
 			lftpc:login_anonymous(Socket, ?FTP_TIMEOUT, []);

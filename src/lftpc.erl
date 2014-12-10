@@ -13,6 +13,9 @@
 -include("lftpc_types.hrl").
 
 %% API exports
+-export([request/3]).
+-export([request/4]).
+-export([request/5]).
 -export([request/6]).
 -export([send_data_part/2]).
 -export([send_data_part/3]).
@@ -20,22 +23,20 @@
 %% Socket API
 -export([close/1]).
 -export([getopts/2]).
--export([peername/1]).
 -export([setopts/2]).
--export([sockname/1]).
 
 %% Utility API
 -export([require/1]).
 -export([start/0]).
 
 %% High-level FTP API
+-export([abort/3]).
 -export([append/5]).
--export([auth_tls/1]).
+-export([auth_tls/2]).
 -export([cd/4]).
 -export([cdup/3]).
 -export([connect/3]).
 -export([connect/4]).
--export([data_mode/2]).
 -export([delete/4]).
 -export([disconnect/3]).
 -export([features/3]).
@@ -52,9 +53,10 @@
 -export([restart/5]).
 -export([retrieve/4]).
 -export([rmdir/4]).
--export([start_data/3]).
+-export([start_transfer/3]).
 -export([store/5]).
 -export([system_type/3]).
+-export([transfer_mode/2]).
 -export([type/4]).
 
 %% Low-level FTP API
@@ -111,61 +113,99 @@
 -export([ftp_type/4]).
 -export([ftp_user/4]).
 
-%% Internal
--export([is_int_response/1]).
--export([is_pos_response/1]).
--export([is_pre_response/1]).
--export([is_pre_pos_response/1]).
--export([is_response_code/2]).
-
 %%====================================================================
 %% API functions
 %%====================================================================
 
+request(Socket, Command, Timeout) ->
+	request(Socket, Command, undefined, undefined, Timeout, []).
+
+request(Socket, Command, Argument, Timeout) ->
+	request(Socket, Command, Argument, undefined, Timeout, []).
+
+request(Socket, Command, Argument, Data, Timeout) ->
+	request(Socket, Command, Argument, Data, Timeout, []).
+
 request(Socket, Command, Argument, Data, Timeout, Options) ->
 	ok = verify_options(Options, []),
-	SendRetry = proplists:get_value(send_retry, Options, 1),
-	do_request_retry(Socket, Command, Argument, Data, Timeout, Options, SendRetry).
+	ReqId = now(),
+	case proplists:is_defined(stream_to, Options) of
+		true ->
+			StreamTo = proplists:get_value(stream_to, Options),
+			Args = [ReqId, StreamTo, Socket, Command, Argument, Data, Options],
+			Pid = spawn(lftpc_client, request, Args),
+			spawn(fun() ->
+				R = kill_client_after(Pid, Timeout),
+				StreamTo ! {response, ReqId, Pid, R}
+			end),
+			{ReqId, Pid};
+		false ->
+			Args = [ReqId, self(), Socket, Command, Argument, Data, Options],
+			Pid = spawn_link(lftpc_client, request, Args),
+			receive
+				{response, ReqId, Pid, R} ->
+					R;
+				{exit, ReqId, Pid, Reason} ->
+					exit(Reason);
+				{'EXIT', Pid, Reason} ->
+					exit(Reason)
+			after
+				Timeout ->
+					kill_client(Pid)
+			end
+	end.
 
-send_data_part({Client, Window}, Data) ->
-	send_data_part({Client, Window}, Data, infinity).
+send_data_part({Pid, Window}, Data) ->
+	send_data_part({Pid, Window}, Data, infinity).
 
-send_data_part({Client, _Window}, ftp_eod, _Timeout)
-		when is_pid(Client) ->
-	Client ! {data_part, self(), ftp_eod},
-	ok = ack_flush(Client),
-	{ok, Client};
-send_data_part({Client, 0}, Data, Timeout)
-		when is_pid(Client) ->
+send_data_part({Pid, _Window}, ftp_eod, Timeout) when is_pid(Pid) ->
+	Pid ! {data_part, self(), ftp_eod},
+	read_client_response(Pid, Timeout);
+send_data_part({Pid, 0}, Data, Timeout) when is_pid(Pid) ->
 	receive
-		{ack, Client} ->
-			send_data_part({Client, 1}, Data, Timeout)
+		{ack, Pid} ->
+			send_data_part({Pid, 1}, Data, Timeout);
+		{ftp_eod, Pid, R} ->
+			{ok, R};
+		{ftp_error, Pid, Reason} ->
+			{error, Reason};
+		{ftp_closed, Pid} ->
+			{error, closed};
+		{response, _ReqId, Pid, R} ->
+			R;
+		{exit, _ReqId, Pid, Reason} ->
+			exit(Reason);
+		{'EXIT', Pid, Reason} ->
+			exit(Reason)
 	after
 		Timeout ->
-			kill_client(Client)
+			kill_client(Pid)
 	end;
-send_data_part({Client, infinity}, Data, _Timeout)
-		when is_pid(Client) ->
-	Client ! {data_part, self(), Data},
-	ok = receive
-		{ack, Client} ->
-			ok
-	after
-		0 ->
-			ok
-	end,
-	{ok, {Client, infinity}};
-send_data_part({Client, Window}, Data, _Timeout)
-		when is_pid(Client)
-		andalso is_integer(Window)
-		andalso Window > 0 ->
-	Client ! {data_part, self(), Data},
+send_data_part({Pid, Window}, Data, _Timeout) when is_pid(Pid) ->
+	Pid ! {data_part, self(), Data},
 	receive
-		{ack, Client} ->
-			{ok, {Client, Window}}
+		{ack, Pid} ->
+			{ok, {Pid, Window}};
+		{ftp_eod, Pid, R} ->
+			{ok, R};
+		{ftp_error, Pid, Reason} ->
+			{error, Reason};
+		{ftp_closed, Pid} ->
+			{error, closed};
+		{response, _ReqId, Pid, R} ->
+			R;
+		{exit, _ReqId, Pid, Reason} ->
+			exit(Reason);
+		{'EXIT', Pid, Reason} ->
+			exit(Reason)
 	after
 		0 ->
-			{ok, {Client, Window - 1}}
+			case Window of
+				_ when is_integer(Window) andalso Window > 0 ->
+					{ok, {Pid, Window - 1}};
+				_ ->
+					{ok, {Pid, Window}}
+			end
 	end.
 
 %%====================================================================
@@ -178,14 +218,8 @@ close(Socket) ->
 getopts(Socket, Options) ->
 	lftpc_sock:getopts(Socket, Options).
 
-peername(Socket) ->
-	lftpc_sock:peername(Socket).
-
 setopts(Socket, Options) ->
 	lftpc_sock:setopts(Socket, Options).
-
-sockname(Socket) ->
-	lftpc_sock:sockname(Socket).
 
 %%====================================================================
 %% Utility API functions
@@ -215,48 +249,52 @@ start() ->
 %%% High-level FTP API functions
 %%%===================================================================
 
+abort(Socket, Timeout, Options) ->
+	case ftp_abor(Socket, Timeout, Options) of
+		{ok, AborResponse} ->
+			ok = lftpc_sock:close(Socket),
+			case is_ftp_between(AborResponse, 200, 500) of
+				true ->
+					{ok, AborResponse};
+				false ->
+					{error, {badreply, [AborResponse]}}
+			end;
+		AborSocketError ->
+			AborSocketError
+	end.
+
 append(Socket, Pathname, Data, Timeout, Options) ->
-	case start_data(Socket, Timeout, Options) of
+	case start_transfer(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_appe(Socket, Pathname, Data, Timeout, Options) of
-				{ok, AppeResponse={_, Pid}} when is_pid(Pid) ->
-					case is_pre_response(AppeResponse) of
-						true ->
-							{ok, AppeResponse};
-						false ->
-							{error, AppeResponse}
-					end;
+				{ok, AppeResponse={_, {Pid, _}}} when is_pid(Pid) ->
+					{ok, AppeResponse};
 				{ok, AppeResponse} ->
-					case is_pos_response(AppeResponse) of
+					case is_ftp_between(AppeResponse, 200, 300) of
 						true ->
 							{ok, AppeResponse};
 						false ->
-							{error, AppeResponse}
+							{error, {badreply, [AppeResponse]}}
 					end;
 				AppeSocketError ->
 					AppeSocketError
 			end;
-		StartDataError ->
-			StartDataError
+		StartTransferError ->
+			StartTransferError
 	end.
 
-auth_tls(Socket) ->
-	case maybe_tls(Socket, explicit, infinity) of
-		{ok, {_, Socket}} ->
-			ok;
-		TLSError ->
-			TLSError
-	end.
+auth_tls(Socket, Timeout) ->
+	maybe_auth_tls(Socket, explicit, Timeout).
 
 cd(Socket, Directory, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_cwd(Socket, Directory, Timeout, Opts) of
 		{ok, CwdResponse} ->
-			case is_response_code(CwdResponse, 250) of
+			case is_ftp_code(CwdResponse, 250) of
 				true ->
 					{ok, CwdResponse};
 				false ->
-					{error, CwdResponse}
+					{error, {badreply, [CwdResponse]}}
 			end;
 		CwdSocketError ->
 			CwdSocketError
@@ -266,21 +304,21 @@ cdup(Socket, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_cdup(Socket, Timeout, Opts) of
 		{ok, CdupResponse} ->
-			case is_response_code(CdupResponse, 250) of
+			case is_ftp_code(CdupResponse, 250) of
 				true ->
 					{ok, CdupResponse};
 				false ->
-					{error, CdupResponse}
+					{error, {badreply, [CdupResponse]}}
 			end;
 		CdupSocketError ->
 			CdupSocketError
 	end.
 
-connect(Address, Port, Options) ->
-	connect(Address, Port, Options, infinity).
+connect(Host, Port, Options) ->
+	connect(Host, Port, Options, infinity).
 
-connect(Address, Port, Options, Timeout) ->
-	{TLS, Opts0} = case lists:keytake(tls, 1, Options) of
+connect(Host, Port, Options, Timeout) ->
+	{TLS, Opts} = case lists:keytake(tls, 1, Options) of
 		{value, {tls, explicit}, O0} ->
 			{explicit, O0};
 		{value, {tls, implicit}, _} ->
@@ -288,58 +326,37 @@ connect(Address, Port, Options, Timeout) ->
 		_ ->
 			{false, Options}
 	end,
-	{Active, Opts1} = case lists:keytake(active, 1, Opts0) of
-		{value, {active, false}, O1} ->
-			{false, O1};
-		{value, {active, once}, O1} ->
-			{once, O1};
-		{value, {active, true}, O1} ->
-			{true, O1};
-		_ ->
-			{false, Opts0}
-	end,
-	case lftpc_sock:connect(Address, Port, Opts1, Timeout) of
+	case lftpc_sock:connect(Host, Port, Opts, Timeout) of
 		{ok, Socket} ->
-			case read_response_timeout(Socket, undefined, Timeout) of
-				{ok, Result} ->
-					case is_pos_response(Result) of
-						true ->
-							case maybe_tls(Socket, TLS, Timeout) of
-								{ok, _} ->
-									lftpc_sock:setopts(Socket, [{active, Active}]),
-									{ok, Result};
-								TLSError ->
-									ok = close(Socket),
-									TLSError
-							end;
-						false ->
-							ok = close(Socket),
-							{error, Result}
+			case read_sock_response(Socket, [], Timeout) of
+				{ok, {Pre, Post={C, _}, Socket}} when C >= 200 andalso C < 400 ->
+					case maybe_auth_tls(Socket, TLS, Timeout) of
+						ok ->
+							{ok, {Pre, Post, Socket}};
+						TLSError ->
+							ok = lftpc_sock:close(Socket),
+							TLSError
 					end;
+				{ok, {Pre, Post, Socket}} ->
+					ok = lftpc_sock:close(Socket),
+					{error, {badreply, [{Pre, Post, undefined}]}};
 				{error, Reason} ->
-					ok = close(Socket),
+					ok = lftpc_sock:close(Socket),
 					{error, Reason}
 			end;
 		ConnectError ->
 			ConnectError
 	end.
 
-data_mode(Socket, Open)
-		when Open =:= active
-		orelse Open =:= passive
-		orelse Open =:= extended_active
-		orelse Open =:= extended_passive ->
-	lftpc_sock:setopts(Socket, [{open, Open}]).
-
 delete(Socket, Filename, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_dele(Socket, Filename, Timeout, Opts) of
 		{ok, DeleResponse} ->
-			case is_response_code(DeleResponse, 250) of
+			case is_ftp_code(DeleResponse, 250) of
 				true ->
 					{ok, DeleResponse};
 				false ->
-					{error, DeleResponse}
+					{error, {badreply, [DeleResponse]}}
 			end;
 		DeleSocketError ->
 			DeleSocketError
@@ -349,11 +366,11 @@ disconnect(Socket, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_quit(Socket, Timeout, Opts) of
 		{ok, QuitResponse} ->
-			case is_pos_response(QuitResponse) of
+			case is_ftp_between(QuitResponse, 200, 400) of
 				true ->
 					{ok, QuitResponse};
 				false ->
-					{error, QuitResponse}
+					{error, {badreply, [QuitResponse]}}
 			end;
 		QuitSocketError ->
 			QuitSocketError
@@ -363,11 +380,11 @@ features(Socket, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_feat(Socket, Timeout, Opts) of
 		{ok, FeatResponse} ->
-			case is_response_code(FeatResponse, 211) of
+			case is_ftp_code(FeatResponse, 211) of
 				true ->
 					{ok, FeatResponse};
 				false ->
-					{error, FeatResponse}
+					{error, {badreply, [FeatResponse]}}
 			end;
 		FeatSocketError ->
 			FeatSocketError
@@ -377,14 +394,28 @@ keep_alive(Socket, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_noop(Socket, Timeout, Opts) of
 		{ok, NoopResponse} ->
-			case is_pos_response(NoopResponse) of
+			case is_ftp_between(NoopResponse, 200, 400) of
 				true ->
 					{ok, NoopResponse};
 				false ->
-					{error, NoopResponse}
+					{error, {badreply, [NoopResponse]}}
 			end;
 		NoopSocketError ->
 			NoopSocketError
+	end.
+
+mkdir(Socket, Directory, Timeout, Options) ->
+	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
+	case ftp_mkd(Socket, Directory, Timeout, Opts) of
+		{ok, MkdResponse} ->
+			case is_ftp_code(MkdResponse, 257) of
+				true ->
+					{ok, MkdResponse};
+				false ->
+					{error, {badreply, [MkdResponse]}}
+			end;
+		MkdSocketError ->
+			MkdSocketError
 	end.
 
 login_anonymous(Socket, Timeout, Options) ->
@@ -406,11 +437,11 @@ login(Socket, Credentials, Timeout, Options) ->
 		(User) ->
 			case ftp_user(Socket, User, Timeout, Opts) of
 				{ok, UserResponse} ->
-					case is_pos_response(UserResponse) of
+					case is_ftp_between(UserResponse, 200, 400) of
 						true ->
 							{ok, [UserResponse]};
 						false ->
-							{error, UserResponse}
+							{error, {badreply, [UserResponse]}}
 					end;
 				UserSocketError ->
 					UserSocketError
@@ -422,11 +453,11 @@ login(Socket, Credentials, Timeout, Options) ->
 		(Pass) ->
 			case ftp_pass(Socket, Pass, Timeout, Opts) of
 				{ok, PassResponse} ->
-					case is_pos_response(PassResponse) of
+					case is_ftp_between(PassResponse, 200, 400) of
 						true ->
 							{ok, [PassResponse]};
 						false ->
-							{error, PassResponse}
+							{error, {badreply, [PassResponse]}}
 					end;
 				PassSocketError ->
 					PassSocketError
@@ -438,11 +469,11 @@ login(Socket, Credentials, Timeout, Options) ->
 		(Acct) ->
 			case ftp_acct(Socket, Acct, Timeout, Opts) of
 				{ok, AcctResponse} ->
-					case is_pos_response(AcctResponse) of
+					case is_ftp_between(AcctResponse, 200, 400) of
 						true ->
 							{ok, [AcctResponse]};
 						false ->
-							{error, AcctResponse}
+							{error, {badreply, [AcctResponse]}}
 					end;
 				AcctSocketError ->
 					AcctSocketError
@@ -466,128 +497,60 @@ login(Socket, Credentials, Timeout, Options) ->
 	end.
 
 ls(Socket, Timeout, Options) ->
-	case start_data(Socket, Timeout, Options) of
-		{ok, _} ->
-			case ftp_list(Socket, Timeout, Options) of
-				{ok, ListResponse={_, Pid}} when is_pid(Pid) ->
-					case is_pre_response(ListResponse) of
-						true ->
-							{ok, ListResponse};
-						false ->
-							{error, ListResponse}
-					end;
-				{ok, ListResponse} ->
-					case is_pos_response(ListResponse) of
-						true ->
-							{ok, ListResponse};
-						false ->
-							{error, ListResponse}
-					end;
-				ListSocketError ->
-					ListSocketError
-			end;
-		StartDataError ->
-			StartDataError
-	end.
+	ls(Socket, undefined, Timeout, Options).
 
 ls(Socket, Pathname, Timeout, Options) ->
-	case start_data(Socket, Timeout, Options) of
+	case start_transfer(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_list(Socket, Pathname, Timeout, Options) of
 				{ok, ListResponse={_, Pid}} when is_pid(Pid) ->
-					case is_pre_response(ListResponse) of
-						true ->
-							{ok, ListResponse};
-						false ->
-							{error, ListResponse}
-					end;
+					{ok, ListResponse};
 				{ok, ListResponse} ->
-					case is_pos_response(ListResponse) of
+					case is_ftp_between(ListResponse, 200, 400) of
 						true ->
 							{ok, ListResponse};
 						false ->
-							{error, ListResponse}
+							{error, {badreply, [ListResponse]}}
 					end;
 				ListSocketError ->
 					ListSocketError
 			end;
-		StartDataError ->
-			StartDataError
-	end.
-
-mkdir(Socket, Directory, Timeout, Options) ->
-	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
-	case ftp_mkd(Socket, Directory, Timeout, Opts) of
-		{ok, MkdResponse} ->
-			case is_response_code(MkdResponse, 257) of
-				true ->
-					{ok, MkdResponse};
-				false ->
-					{error, MkdResponse}
-			end;
-		MkdSocketError ->
-			MkdSocketError
+		StartTransferError ->
+			StartTransferError
 	end.
 
 nlist(Socket, Timeout, Options) ->
-	case start_data(Socket, Timeout, Options) of
-		{ok, _} ->
-			case ftp_nlst(Socket, Timeout, Options) of
-				{ok, NlstResponse={_, Pid}} when is_pid(Pid) ->
-					case is_pre_response(NlstResponse) of
-						true ->
-							{ok, NlstResponse};
-						false ->
-							{error, NlstResponse}
-					end;
-				{ok, NlstResponse} ->
-					case is_pos_response(NlstResponse) of
-						true ->
-							{ok, NlstResponse};
-						false ->
-							{error, NlstResponse}
-					end;
-				NlstSocketError ->
-					NlstSocketError
-			end;
-		StartDataError ->
-			StartDataError
-	end.
+	nlist(Socket, undefined, Timeout, Options).
 
 nlist(Socket, Pathname, Timeout, Options) ->
-	case start_data(Socket, Timeout, Options) of
+	case start_transfer(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_nlst(Socket, Pathname, Timeout, Options) of
 				{ok, NlstResponse={_, Pid}} when is_pid(Pid) ->
-					case is_pre_response(NlstResponse) of
-						true ->
-							{ok, NlstResponse};
-						false ->
-							{error, NlstResponse}
-					end;
+					{ok, NlstResponse};
 				{ok, NlstResponse} ->
-					case is_pos_response(NlstResponse) of
+					case is_ftp_between(NlstResponse, 200, 300) of
 						true ->
 							{ok, NlstResponse};
 						false ->
-							{error, NlstResponse}
+							{error, {badreply, [NlstResponse]}}
 					end;
 				NlstSocketError ->
 					NlstSocketError
 			end;
-		StartDataError ->
-			StartDataError
+		StartTransferError ->
+			StartTransferError
 	end.
 
 pwd(Socket, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_pwd(Socket, Timeout, Opts) of
 		{ok, PwdResponse} ->
-			case is_pos_response(PwdResponse) of
+			case is_ftp_between(PwdResponse, 200, 400) of
 				true ->
 					{ok, PwdResponse};
 				false ->
-					{error, PwdResponse}
+					{error, {badreply, [PwdResponse]}}
 			end;
 		PwdSocketError ->
 			PwdSocketError
@@ -597,21 +560,21 @@ rename(Socket, Old, New, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_rnfr(Socket, Old, Timeout, Opts) of
 		{ok, RnfrResponse} ->
-			case is_int_response(RnfrResponse) of
+			case is_ftp_between(RnfrResponse, 300, 400) of
 				true ->
 					case ftp_rnto(Socket, New, Timeout, Opts) of
 						{ok, RntoResponse} ->
-							case is_pos_response(RntoResponse) of
+							case is_ftp_between(RntoResponse, 200, 400) of
 								true ->
 									{ok, [RnfrResponse, RntoResponse]};
 								false ->
-									{error, [RnfrResponse, RntoResponse]}
+									{error, {badreply, [RnfrResponse, RntoResponse]}}
 							end;
 						RntoSocketError ->
 							RntoSocketError
 					end;
 				false ->
-					{error, [RnfrResponse]}
+					{error, {badreply, [RnfrResponse]}}
 			end;
 		RnfrSocketError ->
 			RnfrSocketError
@@ -619,136 +582,131 @@ rename(Socket, Old, New, Timeout, Options) ->
 
 restart(Socket, Pathname, Offset, Timeout, Options) ->
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
-	case start_data(Socket, Timeout, Options) of
+	case start_transfer(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_rest(Socket, Offset, Timeout, Opts) of
 				{ok, RestResponse} ->
-					case is_pos_response(RestResponse) of
+					case is_ftp_between(RestResponse, 200, 400) of
 						true ->
 							case ftp_retr(Socket, Pathname, Timeout, Options) of
 								{ok, RetrResponse={_, Pid}} when is_pid(Pid) ->
-									case is_pre_response(RetrResponse) of
-										true ->
-											{ok, RetrResponse};
-										false ->
-											{error, RetrResponse}
-									end;
+									{ok, RetrResponse};
 								{ok, RetrResponse} ->
-									case is_pos_response(RetrResponse) of
+									case is_ftp_between(RetrResponse, 200, 400) of
 										true ->
 											{ok, RetrResponse};
 										false ->
-											{error, RetrResponse}
+											{error, {badreply, [RetrResponse]}}
 									end;
 								RetrSocketError ->
 									RetrSocketError
 							end;
 						false ->
-							{error, RestResponse}
+							{error, {badreply, [RestResponse]}}
 					end;
 				RestSocketError ->
 					RestSocketError
 			end;
-		StartDataError ->
-			StartDataError
+		StartTransferError ->
+			StartTransferError
 	end.
 
 retrieve(Socket, Pathname, Timeout, Options) ->
-	case start_data(Socket, Timeout, Options) of
+	case start_transfer(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_retr(Socket, Pathname, Timeout, Options) of
 				{ok, RetrResponse={_, Pid}} when is_pid(Pid) ->
-					case is_pre_response(RetrResponse) of
-						true ->
-							{ok, RetrResponse};
-						false ->
-							{error, RetrResponse}
-					end;
+					{ok, RetrResponse};
 				{ok, RetrResponse} ->
-					case is_pos_response(RetrResponse) of
+					case is_ftp_between(RetrResponse, 200, 400) of
 						true ->
 							{ok, RetrResponse};
 						false ->
-							{error, RetrResponse}
+							{error, {badreply, [RetrResponse]}}
 					end;
 				RetrSocketError ->
 					RetrSocketError
 			end;
-		StartDataError ->
-			StartDataError
+		StartTransferError ->
+			StartTransferError
 	end.
 
 rmdir(Socket, Directory, Timeout, Options) ->
 	case ftp_rmd(Socket, Directory, Timeout, Options) of
 		{ok, RmdResponse} ->
-			case is_response_code(RmdResponse, 250) of
+			case is_ftp_code(RmdResponse, 250) of
 				true ->
 					{ok, RmdResponse};
 				false ->
-					{error, RmdResponse}
+					{error, {badreply, [RmdResponse]}}
 			end;
 		RmdSocketError ->
 			RmdSocketError
 	end.
 
-start_data(Socket, Timeout, Options) ->
-	case lftpc_sock:open(Socket) of
-		{ok, Command} ->
-			Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
-			case request(Socket, Command, undefined, undefined, Timeout, Opts) of
-				{ok, Response} ->
-					case is_pos_response(Response) of
-						true ->
-							{ok, Response};
-						false ->
-							{error, Response}
-					end;
-				SocketError ->
-					SocketError
+start_transfer(Socket, Timeout, Options) ->
+	Command = case lftpc_server:get_transfer_mode(Socket) of
+		passive ->
+			<<"PASV">>;
+		active ->
+			<<"PORT">>;
+		extended_passive ->
+			<<"EPSV">>;
+		extended_active ->
+			<<"EPRT">>
+	end,
+	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
+	case request(Socket, Command, undefined, undefined, Timeout, Opts) of
+		{ok, Response} ->
+			case is_ftp_between(Response, 200, 400) of
+				true ->
+					{ok, Response};
+				false ->
+					{error, {badreply, [Response]}}
 			end;
-		OpenError ->
-			OpenError
+		SocketError ->
+			SocketError
 	end.
 
 store(Socket, Pathname, Data, Timeout, Options) ->
-	case start_data(Socket, Timeout, Options) of
+	case start_transfer(Socket, Timeout, Options) of
 		{ok, _} ->
 			case ftp_stor(Socket, Pathname, Data, Timeout, Options) of
-				{ok, StorResponse={_, Pid}} when is_pid(Pid) ->
-					case is_pre_response(StorResponse) of
-						true ->
-							{ok, StorResponse};
-						false ->
-							{error, StorResponse}
-					end;
+				{ok, StorResponse={_, {Pid, _}}} when is_pid(Pid) ->
+					{ok, StorResponse};
 				{ok, StorResponse} ->
-					case is_pos_response(StorResponse) of
+					case is_ftp_between(StorResponse, 200, 400) of
 						true ->
 							{ok, StorResponse};
 						false ->
-							{error, StorResponse}
+							{error, {badreply, [StorResponse]}}
 					end;
 				StorSocketError ->
 					StorSocketError
 			end;
-		StartDataError ->
-			StartDataError
+		StartTransferError ->
+			StartTransferError
 	end.
 
 system_type(Socket, Timeout, Options) ->
 	case ftp_syst(Socket, Timeout, Options) of
 		{ok, SystResponse} ->
-			case is_pos_response(SystResponse) of
+			case is_ftp_between(SystResponse, 200, 400) of
 				true ->
 					{ok, SystResponse};
 				false ->
-					{error, SystResponse}
+					{error, {badreply, [SystResponse]}}
 			end;
 		SystSocketError ->
 			SystSocketError
 	end.
 
-type(Socket, Type, Timeout, Options) when Type =:= ascii orelse Type =:= binary ->
+transfer_mode(Socket, Mode) ->
+	lftpc_sever:set_transfer_mode(Socket, Mode).
+
+type(Socket, Type, Timeout, Options)
+		when Type =:= ascii
+		orelse Type =:= binary ->
 	TypeCode = case Type of
 		ascii ->
 			$A;
@@ -758,11 +716,11 @@ type(Socket, Type, Timeout, Options) when Type =:= ascii orelse Type =:= binary 
 	Opts = [{K, V} || {K, V} <- Options, K =:= send_retry],
 	case ftp_type(Socket, TypeCode, Timeout, Opts) of
 		{ok, TypeResponse} ->
-			case is_pos_response(TypeResponse) of
+			case is_ftp_between(TypeResponse, 200, 400) of
 				true ->
 					{ok, TypeResponse};
 				false ->
-					{error, TypeResponse}
+					{error, {badreply, [TypeResponse]}}
 			end;
 		TypeSocketError ->
 			TypeSocketError
@@ -933,113 +891,24 @@ ftp_user(Socket, Username, Timeout, Options) ->
 %%%-------------------------------------------------------------------
 
 %% @private
-ack_flush(Client) ->
-	receive
-		{ack, Client} ->
-			ack_flush(Client)
-	after
-		0 ->
-			ok
-	end.
-
-%% @private
 -spec bad_options([term()]) -> no_return().
 bad_options(Errors) ->
 	erlang:error({bad_options, Errors}).
 
 %% @private
-cancel_timeout(TRef) when is_reference(TRef) ->
-	catch erlang:cancel_timer(TRef),
-	receive
-		{timeout, TRef, timeout} ->
-			ok
-	after
-		0 ->
-			ok
-	end;
-cancel_timeout(_) ->
-	ok.
-
-%% @private
-do_request_retry(Socket, Command, Argument, Data, Timeout, Options, 0) ->
-	case lftpc_sock:start_request(Socket) of
-		{ok, {ReqId, Pid}} ->
-			do_request(ReqId, Pid, Socket, Command, Argument, Data, Timeout, Options);
-		StartError ->
-			StartError
-	end;
-do_request_retry(Socket, Command, Argument, Data, Timeout, Options, SendRetry) ->
-	case lftpc_sock:start_request(Socket) of
-		{ok, {ReqId, Pid}} ->
-			do_request(ReqId, Pid, Socket, Command, Argument, Data, Timeout, Options);
-		_ ->
-			do_request_retry(Socket, Command, Argument, Data, Timeout, Options, SendRetry - 1)
-	end.
-
-%% @private
-do_request(ReqId, Pid, _Socket, Command, Argument, Data, Timeout, Options) ->
-	case proplists:is_defined(stream_to, Options) of
-		true ->
-			StreamTo = proplists:get_value(stream_to, Options),
-			Pid ! {request, ReqId, StreamTo, self(), Command, Argument, Data, Options},
-			spawn(fun() ->
-				R = kill_client_after(Pid, Timeout),
-				StreamTo ! {response, ReqId, Pid, R}
-			end),
-			{ReqId, Pid};
-		false ->
-			Pid ! {request, ReqId, self(), self(), Command, Argument, Data, Options},
-			receive
-				{response, ReqId, Pid, R} ->
-					R;
-				{exit, ReqId, Pid, Reason} ->
-					exit(Reason);
-				{'EXIT', Pid, Reason} ->
-					exit(Reason)
-			after
-				Timeout ->
-					kill_client(Pid)
-			end
-	end.
-
-%% @private
-is_int_response({[{Code, _} | _], _}) when Code >= 300 andalso Code < 400 ->
+is_ftp_between({{C, _}, _, _}, A, B) when A >= 100 andalso A < 200 andalso C >= A andalso C < B ->
 	true;
-is_int_response({[{_, _} | Rest], Pid}) ->
-	is_int_response({Rest, Pid});
-is_int_response({[], _}) ->
+is_ftp_between({_, {C, _}, _}, A, B) when C >= A andalso C < B ->
+	true;
+is_ftp_between(_, _, _) ->
 	false.
 
 %% @private
-is_pos_response({[{Code, _} | _], _}) when Code >= 200 andalso Code < 400 ->
+is_ftp_code({{C, _}, _, _}, C) when C >= 100 andalso C < 200 ->
 	true;
-is_pos_response({[{_, _} | Rest], Pid}) ->
-	is_pos_response({Rest, Pid});
-is_pos_response({[], _}) ->
-	false.
-
-%% @private
-is_pre_response({[{Code, _} | _], _}) when Code >= 100 andalso Code < 200 ->
+is_ftp_code({_, {C, _}, _}, C) ->
 	true;
-is_pre_response({[{_, _} | Rest], Pid}) ->
-	is_pre_response({Rest, Pid});
-is_pre_response({[], _}) ->
-	false.
-
-%% @private
-is_pre_pos_response({[{Code, _} | _], _}) when Code >= 100 andalso Code < 300 ->
-	true;
-is_pre_pos_response({[{_, _} | Rest], Pid}) ->
-	is_pre_pos_response({Rest, Pid});
-is_pre_pos_response({[], _}) ->
-	false.
-
-%% @private
-is_response_code({[{Code, _} | _], _}, Code) ->
-	true;
-is_response_code({[{_, _} | Rest], Pid}, Code) ->
-	is_response_code({Rest, Pid}, Code);
-is_response_code({[], _}, _Code) ->
+is_ftp_code(_, _) ->
 	false.
 
 %% @private
@@ -1073,97 +942,96 @@ kill_client_after(Pid, Timeout) ->
 				{'DOWN', Monitor, process, Pid, Reason} ->
 					erlang:error(Reason)
 			after
-				5000 ->
+				1000 ->
 					exit(Pid, kill),
 					exit(normal)
 			end
 	end.
 
 %% @private
-maybe_tls(Socket, false, _) ->
-	{ok, {undefined, Socket}};
-maybe_tls(Socket, explicit, Timeout) ->
+maybe_auth_tls(_, false, _) ->
+	ok;
+maybe_auth_tls(Socket, explicit, Timeout) ->
 	case ftp_auth(Socket, <<"TLS">>, Timeout, []) of
-		{ok, AuthResponse} ->
-			case is_response_code(AuthResponse, 234) of
+		{ok, AuthTLSResponse} ->
+			case is_ftp_code(AuthTLSResponse, 234) of
 				true ->
-					maybe_tls(Socket, implicit, Timeout);
+					maybe_auth_tls(Socket, implicit, Timeout);
 				false ->
-					{error, AuthResponse}
-			end;
-		AuthSocketError ->
-			AuthSocketError
-	end;
-maybe_tls(Socket, implicit, Timeout) ->
-	case ftp_pbsz(Socket, <<"0">>, Timeout, []) of
-		{ok, PbszResponse} ->
-			case is_pos_response(PbszResponse) of
-				true ->
-					case ftp_prot(Socket, <<"P">>, Timeout, []) of
-						{ok, ProtResponse} ->
-							case is_pos_response(ProtResponse) of
+					case ftp_auth(Socket, <<"SSL">>, Timeout, []) of
+						{ok, AuthSSLResponse} ->
+							case is_ftp_code(AuthSSLResponse, 234) of
 								true ->
-									{ok, {undefined, Socket}};
+									maybe_auth_tls(Socket, implicit, Timeout);
 								false ->
-									{error, ProtResponse}
+									{error, {badreply, [AuthTLSResponse, AuthSSLResponse]}}
 							end;
-						ProtSocketError ->
-							ProtSocketError
-					end;
-				false ->
-					{error, PbszResponse}
+						AuthSSLSocketError ->
+							AuthSSLSocketError
+					end
 			end;
+		AuthTLSSocketError ->
+			AuthTLSSocketError
+	end;
+maybe_auth_tls(Socket, implicit, Timeout) ->
+	case ftp_pbsz(Socket, <<"0">>, Timeout, []) of
+		{ok, {_, {C, _}, _}} when C >= 200 andalso C < 400 ->
+			case ftp_prot(Socket, <<"P">>, Timeout, []) of
+				{ok, {_, {C, _}, _}} when C >= 200 andalso C < 400 ->
+					ok;
+				{ok, ProtResponse} ->
+					{error, {badreply, [ProtResponse]}};
+				ProtSocketError ->
+					ProtSocketError
+			end;
+		{ok, PbszResponse} ->
+			{error, {badreply, [PbszResponse]}};
 		PbszSocketError ->
 			PbszSocketError
 	end.
 
 %% @private
-read_response(Socket, Ref, Acc) ->
-	lftpc_sock:setopts(Socket, [{active, once}]),
+read_client_response(Pid, Timeout) ->
 	receive
-		{ftp, Socket, {Ref, Reply={Code, _}}} when Code >= 200 andalso Code < 600 ->
-			lftpc_sock:setopts(Socket, [{active, once}]),
-			receive
-				{ftp, Socket, {Ref, done}} ->
-					{ok, {lists:reverse([Reply | Acc]), Socket}}
-			end;
-		{ftp, Socket, {Ref, Reply={_, _}}} ->
-			read_response(Socket, Ref, [Reply | Acc]);
-		{ftp_error, Socket, {Ref, Reason}} ->
+		{ack, Pid} ->
+			read_client_response(Pid, Timeout);
+		{ftp_eod, Pid, R} ->
+			{ok, R};
+		{ftp_error, Pid, Reason} ->
 			{error, Reason};
-		{ftp_closed, Socket} ->
-			{error, closed}
+		{ftp_closed, Pid} ->
+			{error, closed};
+		{response, _ReqId, Pid, R} ->
+			R;
+		{exit, _ReqId, Pid, Reason} ->
+			exit(Reason);
+		{'EXIT', Pid, Reason} ->
+			exit(Reason)
+	after
+		Timeout ->
+			kill_client(Pid)
 	end.
 
 %% @private
-read_response(Socket, Ref, Acc, TRef) ->
-	lftpc_sock:setopts(Socket, [{active, once}]),
+read_sock_response(Socket, Replies, Timeout) ->
 	receive
-		{ftp, Socket, {Ref, Reply={Code, _}}} when Code >= 200 andalso Code < 600 ->
-			lftpc_sock:setopts(Socket, [{active, once}]),
-			receive
-				{ftp, Socket, {Ref, done}} ->
-					ok = cancel_timeout(TRef),
-					{ok, {lists:reverse([Reply | Acc]), Socket}}
+		{ftp, Socket, undefined, Reply} ->
+			read_sock_response(Socket, [Reply | Replies], Timeout);
+		{ftp_eod, Socket, undefined, Reply} ->
+			case Replies of
+				[] ->
+					{ok, {undefined, Reply, Socket}};
+				[R] ->
+					{ok, {R, Reply, Socket}}
 			end;
-		{ftp, Socket, {Ref, Reply={_, _}}} ->
-			read_response(Socket, Ref, [Reply | Acc]);
-		{ftp_error, Socket, {Ref, Reason}} ->
-			ok = cancel_timeout(TRef),
+		{ftp_error, Socket, undefined, Reason} ->
 			{error, Reason};
-		{ftp_closed, Socket} ->
-			ok = cancel_timeout(TRef),
-			{error, closed};
-		{timeout, TRef, timeout} ->
+		{ftp_closed, Socket, undefined} ->
+			{error, closed}
+	after
+		Timeout ->
 			{error, timeout}
 	end.
-
-%% @private
-read_response_timeout(Socket, Ref, infinity) ->
-	read_response(Socket, Ref, []);
-read_response_timeout(Socket, Ref, Timeout) ->
-	TRef = erlang:start_timer(Timeout, self(), timeout),
-	read_response(Socket, Ref, [], TRef).
 
 %% @private
 verify_credentials([{account, Account} | Options], Errors)
@@ -1184,6 +1052,12 @@ verify_credentials([], Errors) ->
 
 %% @private
 -spec verify_options(options(), [term()]) -> ok | none().
+verify_options([{ctrl_decoder, {CtrlDecoder, _}} | Options], Errors)
+		when is_function(CtrlDecoder, 2) ->
+	verify_options(Options, Errors);
+verify_options([{data_decoder, {DataDecoder, _}} | Options], Errors)
+		when is_function(DataDecoder, 2) ->
+	verify_options(Options, Errors);
 verify_options([{partial_download, DownloadOptions} | Options], Errors)
 		when is_list(DownloadOptions) ->
 	case verify_partial_download_options(DownloadOptions, []) of

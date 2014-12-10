@@ -9,7 +9,7 @@
 %%% Created :  07 Nov 2014 by Andrew Bennett <andrew@pixid.com>
 %%%-------------------------------------------------------------------
 
--ifndef(LFTPC_SOCK_HRL).
+-ifndef(LFTPC_INLINE_HRL).
 
 %% INLINE_UPPERCASE_BC(Bin)
 %%
@@ -46,6 +46,6 @@
 		C -> C
 	end >> || << C >> <= Bin >>).
 
--define(LFTPC_SOCK_HRL, 1).
+-define(LFTPC_INLINE_HRL, 1).
 
 -endif.
