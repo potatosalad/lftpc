@@ -103,35 +103,3 @@ terminate(_Reason, _State) ->
 %% @private
 code_change(_OldVsn, State, _Extra) ->
 	{ok, State}.
-
-% handle_call({set_session_opts, Ref, })
-
-% handle_call({set_new_listener_opts, Ref, MaxConns, Opts}, _, State) ->
-% 	ets:insert(?TAB, {{max_conns, Ref}, MaxConns}),
-% 	ets:insert(?TAB, {{opts, Ref}, Opts}),
-% 	{reply, ok, State};
-% handle_call({set_connections_sup, Ref, Pid}, _,
-% 		State=#state{monitors=Monitors}) ->
-% 	case ets:insert_new(?TAB, {{conns_sup, Ref}, Pid}) of
-% 		true ->
-% 			MonitorRef = erlang:monitor(process, Pid),
-% 			{reply, true,
-% 				State#state{monitors=[{{MonitorRef, Pid}, Ref}|Monitors]}};
-% 		false ->
-% 			{reply, false, State}
-% 	end;
-% handle_call({set_port, Ref, Port}, _, State) ->
-% 	true = ets:insert(?TAB, {{port, Ref}, Port}),
-% 	{reply, ok, State};
-% handle_call({set_max_conns, Ref, MaxConns}, _, State) ->
-% 	ets:insert(?TAB, {{max_conns, Ref}, MaxConns}),
-% 	ConnsSup = get_connections_sup(Ref),
-% 	ConnsSup ! {set_max_conns, MaxConns},
-% 	{reply, ok, State};
-% handle_call({set_opts, Ref, Opts}, _, State) ->
-% 	ets:insert(?TAB, {{opts, Ref}, Opts}),
-% 	ConnsSup = get_connections_sup(Ref),
-% 	ConnsSup ! {set_opts, Opts},
-% 	{reply, ok, State};
-% handle_call(_Request, _From, State) ->
-% 	{reply, ignore, State}.
