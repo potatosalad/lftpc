@@ -2,12 +2,13 @@
 %% vim: ts=4 sw=4 ft=erlang noet
 {application, lftpc, [
 	{description, "Lightweight Erlang FTP Client"},
-	{vsn, "1.0.0"},
+	{vsn, "1.0.1"},
 	{registered, []},
 	{applications, [
 		kernel,
 		stdlib,
 		crypto,
+		asn1,
 		public_key,
 		ssl,
 		ranch,

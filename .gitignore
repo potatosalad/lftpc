@@ -6,8 +6,10 @@ _*
 *.swp
 *.swo
 .erlang.cookie
+.erlang.mk.packages.*
 ebin
 log
+ct.coverdata
 erl_crash.dump
 .rebar
 .rebar3
@@ -16,4 +18,6 @@ _rel
 _deps
 _plugins
 _tdeps
+deps
 logs
+test/ct.cover.spec

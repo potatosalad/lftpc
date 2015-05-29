@@ -1,3 +1,3 @@
 PROJECT = lftpc
-
-include rebar3.mk
+DEPS = ranch
+include erlang.mk

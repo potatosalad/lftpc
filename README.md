@@ -6,4 +6,4 @@ Lightweight Erlang FTP Client
 Build
 -----
 
-    $ rebar3 compile
+    $ make tests
