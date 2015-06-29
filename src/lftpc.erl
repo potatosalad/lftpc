@@ -128,7 +128,7 @@ request(Socket, Command, Argument, Data, Timeout) ->
 
 request(Socket, Command, Argument, Data, Timeout, Options) ->
 	ok = verify_options(Options, []),
-	ReqId = erlang:timestamp(),
+	ReqId = make_req_id(),
 	case proplists:is_defined(stream_to, Options) of
 		true ->
 			StreamTo = proplists:get_value(stream_to, Options),
@@ -947,6 +947,15 @@ kill_client_after(Pid, Timeout) ->
 					exit(normal)
 			end
 	end.
+
+%% @private
+-ifdef(time_correction).
+make_req_id() ->
+	erlang:timestamp().
+-else.
+make_req_id() ->
+	erlang:now().
+-endif.
 
 %% @private
 maybe_auth_tls(_, false, _) ->
