@@ -2,7 +2,7 @@
 %% vim: ts=4 sw=4 ft=erlang noet
 %%%-------------------------------------------------------------------
 %%% @author Andrew Bennett <andrew@pixid.com>
-%%% @copyright 2014, Andrew Bennett
+%%% @copyright 2014-2015, Andrew Bennett
 %%% @doc
 %%%
 %%% @end
@@ -128,7 +128,7 @@ request(Socket, Command, Argument, Data, Timeout) ->
 
 request(Socket, Command, Argument, Data, Timeout, Options) ->
 	ok = verify_options(Options, []),
-	ReqId = now(),
+	ReqId = erlang:timestamp(),
 	case proplists:is_defined(stream_to, Options) of
 		true ->
 			StreamTo = proplists:get_value(stream_to, Options),
