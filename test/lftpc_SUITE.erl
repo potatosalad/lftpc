@@ -19,20 +19,20 @@
 
 all() ->
 	[
-		{group, mozilla},
-		{group, rebex}
+		{group, mozilla}%,
+		% {group, rebex}
 	].
 
 groups() ->
 	[
 		{mozilla, [parallel], [
 			ftp
-		]},
-		{rebex, [parallel], [
-			ftp,
-			ftp_explicit,
-			ftp_implicit
-		]}
+		]}%,
+		% {rebex, [parallel], [
+		% 	ftp,
+		% 	ftp_explicit,
+		% 	ftp_implicit
+		% ]}
 	].
 
 init_per_suite(Config) ->
@@ -46,7 +46,8 @@ end_per_suite(_Config) ->
 init_per_group(mozilla, Config) ->
 	[
 		{ftp_host, "ftp.mozilla.org"},
-		{ftp_credentials, anonymous}
+		{ftp_credentials, anonymous},
+		{ftp_directory, <<"pub">>}
 		| Config
 	];
 init_per_group(rebex, Config) ->
@@ -55,7 +56,8 @@ init_per_group(rebex, Config) ->
 		{ftp_credentials, [
 			{username, <<"demo">>},
 			{password, <<"password">>}
-		]}
+		]},
+		{ftp_directory, <<"pub">>}
 		| Config
 	].
 
@@ -67,19 +69,13 @@ end_per_group(_Group, _Config) ->
 %%====================================================================
 
 ftp(Config) ->
-	Host = ?config(ftp_host, Config),
-	Credentials = ?config(ftp_credentials, Config),
-	ftp_smoke(Host, 21, Credentials, []).
+	ftp_smoke(21, [], Config).
 
 ftp_explicit(Config) ->
-	Host = ?config(ftp_host, Config),
-	Credentials = ?config(ftp_credentials, Config),
-	ftp_smoke(Host, 21, Credentials, [{tls, explicit}]).
+	ftp_smoke(21, [{tls, explicit}], Config).
 
 ftp_implicit(Config) ->
-	Host = ?config(ftp_host, Config),
-	Credentials = ?config(ftp_credentials, Config),
-	ftp_smoke(Host, 990, Credentials, [{tls, implicit}]).
+	ftp_smoke(990, [{tls, implicit}], Config).
 
 %%%-------------------------------------------------------------------
 %%% Internal functions
@@ -88,7 +84,14 @@ ftp_implicit(Config) ->
 -define(FTP_TIMEOUT, 10000).
 
 %% @private
-ftp_smoke(Host, Port, Credentials, Options) ->
+ftp_smoke(Port, Options, Config) ->
+	Host = ?config(ftp_host, Config),
+	Credentials = ?config(ftp_credentials, Config),
+	Directory = ?config(ftp_directory, Config),
+	ftp_smoke(Host, Port, Credentials, Options, Directory).
+
+%% @private
+ftp_smoke(Host, Port, Credentials, Options, Directory) ->
 	{ok, {_, _, Socket}} = lftpc:connect(Host, Port, Options),
 	{ok, _} = case Credentials of
 		anonymous ->
@@ -96,7 +99,7 @@ ftp_smoke(Host, Port, Credentials, Options) ->
 		_ ->
 			lftpc:login(Socket, Credentials, ?FTP_TIMEOUT, [])
 	end,
-	{ok, _} = lftpc:cd(Socket, <<"pub">>, ?FTP_TIMEOUT, []),
+	{ok, _} = lftpc:cd(Socket, Directory, ?FTP_TIMEOUT, []),
 	{ok, _R} = lftpc:nlist(Socket, ?FTP_TIMEOUT, []),
 	{ok, _} = lftpc:disconnect(Socket, ?FTP_TIMEOUT, []),
 	ok = lftpc:close(Socket),
